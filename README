@@ -1,0 +1,139 @@
+radioglobe - internet radio on a spinning globe
+
+DESCRIPTION
+	Radioglobe presents an interactive orthographic globe
+	with radio station markers. Click a station to start
+	streaming. Drag to spin the globe. Scroll to zoom.
+
+	Inspired by radio.garden, built for 9front.
+
+USAGE
+	radioglobe [-s stationfile] [-c coastfile] [-r devrate]
+
+	The default station file is /lib/radio/stations and the
+	default coastline file is /lib/radio/coast.dat (also
+	searched for as ./coast.dat).  Samples can be generated
+	with the converters below.
+
+	-r sets the audio device sample rate in Hz (default 44100).
+	Use -r 48000 if your /dev/audio runs at 48 kHz.  See AUDIO.
+
+	To build everything:
+		mk
+
+	To install the binaries:
+		mk install
+
+	To install the data files:
+		mk installdata
+
+	To run:
+		radioglobe
+	or with local data:
+		radioglobe -s stations -c coast.dat
+
+DATA
+
+	Coastlines come from Natural Earth (public domain) and
+	stations from radio-browser.info (open community database).
+	Two converters, built by mk, turn the raw downloads into
+	the formats radioglobe loads.
+
+	Coastlines.  Fetch a Natural Earth coastline GeoJSON, e.g.
+	the coarse 1:110m theme:
+
+		hget https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_110m_coastline.geojson > /tmp/coast.geojson
+		mkcoast < /tmp/coast.geojson > coast.dat
+
+	For more detail use ne_50m_coastline.geojson instead.
+
+	Stations.  Fetch the most-played geolocated stations:
+
+		hget 'https://de1.api.radio-browser.info/json/stations/search?limit=1000&has_geo_info=true&hidebroken=true&order=clickcount&reverse=true' > /tmp/stations.json
+		mkstations < /tmp/stations.json > stations
+
+	mkstations keeps MP3, OGG/Vorbis, and AAC/AAC+ streams by
+	default (AAC needs audio/aacdec installed); pass -a to keep
+	all codecs and HLS, or -b N to require at least N kbps.
+	HLS (.m3u8) playlists are skipped by default since the
+	decoders cannot demux them.
+
+CONTROLS
+	Mouse:
+		Button 1 drag   spin the globe
+		Button 2 click  play station under cursor
+		Button 3        menu (play/stop/reload/exit)
+		Scroll up       zoom in
+		Scroll down     zoom out
+
+	Keyboard:
+		arrows          rotate view
+		+/-             zoom in/out
+		0               reset view
+		space/enter     play selected station
+		s or .          stop playback
+		q or Del        quit
+
+STATION FILE FORMAT
+	Lines of the form:
+		lat lon "station name" stream-url
+	or:
+		lat lon station-name stream-url
+
+	Coordinates are decimal degrees. North latitude and
+	east longitude are positive. Lines starting with #
+	are comments.
+
+COASTLINE FILE FORMAT
+	coast.dat holds one polyline per block.  A header line
+		> N
+	gives the point count N, followed by N lines of
+		lat lon
+	in decimal degrees.  Blank lines and lines starting with
+	# are ignored.  This is what mkcoast emits.
+
+AUDIO
+	Playback runs this rc pipeline per station:
+
+	    play -o /fd/1 URL </dev/null | \
+	        audio/pcmconv -o s16c2r<devrate> >/dev/audio
+
+	play(1) fetches the URL (hget/webfs), detects the format,
+	and decodes it (mp3dec/oggdec/aacdec/...), writing raw PCM
+	to stdout instead of opening /dev/audio itself.  pcmconv
+	then resamples that PCM to the device rate before it reaches
+	/dev/audio.
+
+	Why the pcmconv stage: a decoder that emits 48000 Hz (common
+	for AAC) written straight to a 44100 Hz /dev/audio plays back
+	about 9% too fast ("sped up").  Forcing the rate with pcmconv
+	makes decoder and device agree, fixing the pitch/speed.  Set
+	-r to match your device if it is not 44100 Hz.
+
+	Finding your device rate: the rate is owned by the audio
+	driver and exposed via audio(3).  Read it from /dev/volume:
+
+		grep speed /dev/volume      # e.g. "speed 44100"
+
+	and pass that number to -r.  You can also change the device:
+
+		echo speed 48000 >/dev/volume
+
+	in which case run radioglobe -r 48000 so the two agree.
+
+	For formats not handled by the standard decoders, add a
+	decoder to $path; AAC needs audio/aacdec so play(1) can
+	invoke it for the *aac* case.
+
+REQUIREMENTS
+	webfs(4) must be mounted for HTTP streaming to work.
+	Typically this is already running under rio.
+
+SOURCE
+	main.c         event loop, UI, station management
+	globe.c        orthographic projection, rendering
+	coast.c        loads coast.dat at runtime
+	dat.h          shared types
+	mkcoast.c      GeoJSON coastline -> coast.dat
+	mkstations.c   radio-browser JSON -> stations
+	NOTES.md       project notes / how to resume work
