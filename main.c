@@ -636,6 +636,23 @@ main(int argc, char **argv)
 		case Etick:
 			if(dragging || (vlat == 0.0 && vlon == 0.0))
 				break;
+			/*
+			 * If a keystroke (e.g. quit) is already
+			 * waiting, skip this tick's redraw and let
+			 * the loop go straight back to event() to
+			 * handle it. redraw() runs synchronously and
+			 * isn't free at large dataset scale; without
+			 * this check a fast spin can keep retriggering
+			 * redraws back-to-back and a pending keypress
+			 * can keep "just missing its turn" until the
+			 * spin fully decays. event(2) already
+			 * prioritizes keyboard over the timer when
+			 * both are ready -- this just avoids doing
+			 * more (possibly slow) work before giving it
+			 * the chance to.
+			 */
+			if(ecankbd())
+				break;
 			clon += vlon * Tickms;
 			clat += vlat * Tickms;
 			if(clat > 90.0) clat = 90.0;

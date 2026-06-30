@@ -378,37 +378,37 @@ drawgrid() (lat/lon grid lines), but at ~1500 total points across
 the whole grid it is nowhere near the cost coastlines were, so left
 alone for now.
 
-### Known minor issue: 'q' feels delayed while momentum spin is active
+### Fixed: 'q' felt delayed while momentum spin is active
 
 Observed during testing with coast2.dat/stations2: pressing 'q' (or
 any key) to quit while the inertial spin (see "Momentum / inertial
-spin" above) is still decaying seems to wait for the spin to finish
-before taking effect. Not fixed yet (flagged as low priority), but
-worth recording the likely cause and fix so it isn't rediscovered
-from scratch:
+spin" above) was still decaying seemed to wait for the spin to
+finish before taking effect.
 
-event(2)'s multiplexer (/sys/src/libdraw/event.c) gives each input
-source a fixed priority by its key's bit position -- mouse(1) is
-slave 0, keyboard(2) is slave 1, our timer(4, see Etick in main.c) is
-slave 2 -- and always returns the lowest-index source with data
-ready, so keyboard does outrank the timer in principle. The catch:
-the raw event pipe is only drained (extract()) when the main loop
-calls back into event(), and our Etick case runs redraw() fully and
-synchronously before looping back. At coast2.dat/stations2 scale,
-even after the poly()-batching fix above, a single redraw is not
-free; while it's in flight, an arriving keypress just sits buffered
-in the pipe, unseen, until that redraw call returns. During an
-active fast spin, ticks keep arriving every ~25ms and each one
-retriggers another redraw, so a keystroke can keep "just missing its
-turn" against a steady stream of new ticks -- giving the impression
-input is locked out until the spin fully decays, even though no
-single redraw takes anywhere near that long.
+Cause: event(2)'s multiplexer (/sys/src/libdraw/event.c) gives each
+input source a fixed priority by its key's bit position -- mouse(1)
+is slave 0, keyboard(2) is slave 1, our timer(4, see Etick in
+main.c) is slave 2 -- and always returns the lowest-index source
+with data ready, so keyboard does outrank the timer in principle.
+The catch: the raw event pipe is only drained (extract()) when the
+main loop calls back into event(), and our Etick case ran redraw()
+fully and synchronously before looping back. At coast2.dat/
+stations2 scale, even after the poly()-batching fix above, a single
+redraw is not free; while it's in flight, an arriving keypress just
+sat buffered in the pipe, unseen, until that redraw call returned.
+During an active fast spin, ticks kept arriving every ~25ms and each
+one retriggered another redraw, so a keystroke could keep "just
+missing its turn" against a steady stream of new ticks -- giving the
+impression input was locked out until the spin fully decayed, even
+though no single redraw took anywhere near that long.
 
-Likely fix (not yet implemented): at the top of `case Etick:` in
-main.c, check `ecankbd()` (see event(2)) and `break` (skip this
-tick's redraw) if a keystroke is already waiting, so the loop gets
-back to event() immediately instead of doing another redraw first.
-Should be a small, low-risk, self-contained change in main.c.
+Fix (main.c, case Etick): check `ecankbd()` (event(2)) at the top of
+the tick handler and `break` (skip this tick's redraw entirely) if a
+keystroke is already waiting, so the loop goes straight back to
+event() instead of doing another redraw first. Small, self-contained,
+no effect on the spin's physics (a skipped tick just doesn't apply
+that tick's velocity/friction step; it picks back up next tick if
+the key wasn't a quit).
 
 ## Momentum / inertial spin on drag release (IMPLEMENTED)
 
