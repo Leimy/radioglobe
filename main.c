@@ -24,6 +24,17 @@ enum {
 	Mexit,
 };
 
+/*
+ * Etick: timer event key for momentum/inertial spin.  Emouse==1 and
+ * Ekeyboard==2 are already taken by event(2); 4 is the next power
+ * of two and isn't used elsewhere, so we can request it explicitly
+ * from etimer() and still switch on it as a compile-time constant.
+ */
+enum {
+	Etick = 4,
+	Tickms = 25,		/* ~40Hz */
+};
+
 char *menuitems[] = {
 	"play",
 	"stop",
@@ -38,7 +49,23 @@ double clat = 30.0;
 double clon = 0.0;
 double zoom = 1.0;
 double zoommin = 0.5;
-double zoommax = 8.0;
+//double zoommax = 8.0;
+double zoommax = 128.0;
+
+/*
+ * Momentum/inertial spin: vlat/vlon are the current angular
+ * velocity in degrees per millisecond, tracked continuously while
+ * dragging (see Emouse handling) and consumed on each Etick once
+ * the button is released.  friction decays the velocity each tick;
+ * vmin is the speed below which we consider the spin stopped (and
+ * stop ticking redraw).
+ */
+double vlat = 0.0;
+double vlon = 0.0;
+double lastclat, lastclon;
+ulong lastmsec;
+double friction = 0.92;
+double vmin = 0.0005;
 
 Station *stations;
 int nstation;
@@ -415,6 +442,8 @@ main(int argc, char **argv)
 	if(initdraw(nil, nil, "radioglobe") < 0)
 		sysfatal("initdraw: %r");
 	einit(Emouse | Ekeyboard);
+	if(etimer(Etick, Tickms) != Etick)
+		fprint(2, "warning: etimer failed, no momentum spin\n");
 
 	if(cfile != nil)
 		coastfile(cfile);
@@ -462,6 +491,12 @@ main(int argc, char **argv)
 					dragstart = m.xy;
 					dragclat = clat;
 					dragclon = clon;
+					/* grabbing a spinning globe stops it dead */
+					vlat = 0.0;
+					vlon = 0.0;
+					lastclat = clat;
+					lastclon = clon;
+					lastmsec = m.msec;
 				}
 				if(dragging){
 					rad = ((Dx(screen->r) < Dy(screen->r)) ? Dx(screen->r) : Dy(screen->r)) / 2 - 4;
@@ -474,6 +509,20 @@ main(int argc, char **argv)
 					if(clat < -90.0) clat = -90.0;
 					while(clon > 180.0) clon -= 360.0;
 					while(clon < -180.0) clon += 360.0;
+
+					/*
+					 * Track instantaneous velocity (deg/ms)
+					 * so we have a launch speed if the
+					 * button comes up on this frame.
+					 */
+					if(m.msec > lastmsec){
+						double dt = m.msec - lastmsec;
+						vlat = (clat - lastclat) / dt;
+						vlon = (clon - lastclon) / dt;
+						lastclat = clat;
+						lastclon = clon;
+						lastmsec = m.msec;
+					}
 					redraw();
 				}
 			} else {
@@ -581,6 +630,22 @@ main(int argc, char **argv)
 				redraw();
 				break;
 			}
+			break;
+
+		case Etick:
+			if(dragging || (vlat == 0.0 && vlon == 0.0))
+				break;
+			clon += vlon * Tickms;
+			clat += vlat * Tickms;
+			if(clat > 90.0) clat = 90.0;
+			if(clat < -90.0) clat = -90.0;
+			while(clon > 180.0) clon -= 360.0;
+			while(clon < -180.0) clon += 360.0;
+			vlat *= friction;
+			vlon *= friction;
+			if(fabs(vlat) < vmin && fabs(vlon) < vmin)
+				vlat = vlon = 0.0;
+			redraw();
 			break;
 		}
 	}

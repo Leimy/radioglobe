@@ -18,6 +18,19 @@
 static Image *ocean, *coastcol, *dotcol, *dotsel, *gridcol, *textcol;
 static double dtor;
 
+/*
+ * Cached static globe layer (ocean + grid + coastlines + border).
+ * This is the expensive part to render and it only depends on
+ * (r, clat, clon, zoom).  Lots of redraws -- e.g. just updating the
+ * hover/selection label, or the status bar -- don't change any of
+ * those, so we reuse the cached image instead of re-walking the
+ * whole coastline dataset every time.
+ */
+static Image *cache;
+static Rectangle cacherect;
+static double cclat, cclon, czoom;
+static int cachevalid;
+
 void
 globeinit(void)
 {
@@ -28,6 +41,56 @@ globeinit(void)
 	dotcol = allocimage(display, Rect(0,0,1,1), screen->chan, 1, 0x44dd88ff);
 	dotsel = allocimage(display, Rect(0,0,1,1), screen->chan, 1, 0xff8844ff);
 	textcol = allocimage(display, Rect(0,0,1,1), screen->chan, 1, DWhite);
+}
+
+/*
+ * Convert a Geo to a unit vector on the sphere.  Uses PI directly
+ * (not the file-scope dtor) because this is called from coast.c
+ * during coastinit(), which runs before globeinit() sets dtor.
+ */
+void
+geo2vec(Geo g, Vec3 *v)
+{
+	double lat, lon, cl;
+
+	lat = g.lat * PI / 180.0;
+	lon = g.lon * PI / 180.0;
+	cl = cos(lat);
+	v->x = cl * cos(lon);
+	v->y = cl * sin(lon);
+	v->z = sin(lat);
+}
+
+/*
+ * Compute the screen-space basis vectors for the current view
+ * direction (clat, clon).  ex/ey are the screen-right/screen-up
+ * unit vectors; ez points at the viewer.  Projecting a point is
+ * then just three dot products -- no trig needed per point.
+ */
+static void
+viewbasis(double clat, double clon, Vec3 *ex, Vec3 *ey, Vec3 *ez)
+{
+	double cla, sla, clo, slo;
+
+	cla = cos(clat * dtor);
+	sla = sin(clat * dtor);
+	clo = cos(clon * dtor);
+	slo = sin(clon * dtor);
+
+	ex->x = -slo;       ex->y = clo;        ex->z = 0;
+	ey->x = -sla*clo;   ey->y = -sla*slo;   ey->z = cla;
+	ez->x = cla*clo;    ez->y = cla*slo;    ez->z = sla;
+}
+
+static void
+vecproject(Vec3 *ex, Vec3 *ey, Vec3 *ez, Vec3 p, double *px, double *py, int *vis)
+{
+	double cosc;
+
+	cosc = p.x*ez->x + p.y*ez->y + p.z*ez->z;
+	*vis = cosc > 0.0;
+	*px = p.x*ex->x + p.y*ex->y + p.z*ex->z;
+	*py = p.x*ey->x + p.y*ey->y + p.z*ey->z;
 }
 
 static void
@@ -148,18 +211,94 @@ drawgrid(Image *dst, Rectangle r, double clat, double clon, double zoom)
 	}
 }
 
+/*
+ * Can any point of coastline c possibly be visible, given that "ez"
+ * is the unit vector pointing at the viewer (see viewbasis above)?
+ *
+ * c->center/c->capcos describe a bounding cap: a cone of half-angle
+ * theta (cos(theta) == c->capcos) around c->center that contains
+ * every point of the polyline.  A point p is visible exactly when
+ * dot(p, ez) > 0 (it faces the viewer).  Over the whole cap, the
+ * largest possible value of dot(p, ez) is:
+ *
+ *   - 1, if ez itself lies inside the cap (the cap straddles the
+ *     point nearest the viewer), or
+ *   - cos(angle(center,ez) - theta), otherwise -- i.e. the dot
+ *     product at the cap's edge point closest to ez.
+ *
+ * That maximum is <= 0 exactly when angle(center,ez) >= theta + 90
+ * degrees, which (taking cosines of both sides, and noting
+ * cos(theta+90) == -sin(theta)) is the same as:
+ *
+ *   dot(center, ez) <= -sin(theta)
+ *
+ * sin(theta) is recovered from capcos == cos(theta) without ever
+ * calling an inverse trig function, via sin(theta) = sqrt(1-cos^2).
+ * Since capcos is an exact dot product of two unit vectors it should
+ * already lie in [-1,1], but clamp the radicand anyway in case of
+ * tiny floating-point overshoot.
+ *
+ * This bound can only be conservative in our favor: it may fail to
+ * cull a polyline that turns out to have no visible points once you
+ * look point-by-point (e.g. it bulges toward the viewer in the
+ * middle but no actual data point lands in the visible gap), but it
+ * will never wrongly cull one that does have a visible point.  Worst
+ * case we do the per-point work we would have done anyway.
+ */
+static int
+capvisible(Coastline *c, Vec3 *ez)
+{
+	double dot, s2;
+
+	if(c->capcos == -2)	/* culling disabled for this polyline */
+		return 1;
+
+	dot = c->center.x*ez->x + c->center.y*ez->y + c->center.z*ez->z;
+	s2 = 1.0 - c->capcos*c->capcos;
+	if(s2 < 0)
+		s2 = 0;
+	return dot > -sqrt(s2);
+}
+
 static void
 drawcoasts(Image *dst, Rectangle r, double clat, double clon, double zoom)
 {
-	int i, j, vis, prevvis;
+	int i, j, vis, prevvis, cx, cy, rad;
+	double x, y;
 	Point p, prev;
+	Vec3 ex, ey, ez;
 	Coastline *c;
+
+	cx = (r.min.x + r.max.x) / 2;
+	cy = (r.min.y + r.max.y) / 2;
+	rad = ((Dx(r) < Dy(r)) ? Dx(r) : Dy(r)) / 2 - 4;
+	rad = (int)(rad * zoom);
+
+	/* computed once per call, not once per point */
+	viewbasis(clat, clon, &ex, &ey, &ez);
 
 	for(i = 0; i < ncoast; i++){
 		c = &coasts[i];
+
+		/*
+		 * Quick reject: at any given moment roughly half of
+		 * the planet's coastline is on the far side of the
+		 * globe from the viewer.  Skip the whole polyline --
+		 * without touching a single one of its points -- if
+		 * it cannot possibly have anything visible.  This is
+		 * the difference between "process every coastline
+		 * point on every redraw" and "process only the ones
+		 * that could matter," which is what actually saves
+		 * work as coast.dat grows large.
+		 */
+		if(!capvisible(c, &ez))
+			continue;
+
 		prevvis = 0;
 		for(j = 0; j < c->npts; j++){
-			geo2screen(r, clat, clon, zoom, c->pts[j], &p, &vis);
+			vecproject(&ex, &ey, &ez, c->vec[j], &x, &y, &vis);
+			p.x = cx + (int)(x * rad);
+			p.y = cy - (int)(y * rad);
 			if(vis && prevvis)
 				line(dst, prev, p, Endsquare, Endsquare, 0, coastcol, ZP);
 			prev = p;
@@ -179,25 +318,49 @@ globedraw(Image *dst, Rectangle r, double clat, double clon, double zoom)
 {
 	int cx, cy, rad;
 
-	cx = (r.min.x + r.max.x) / 2;
-	cy = (r.min.y + r.max.y) / 2;
-	rad = ((Dx(r) < Dy(r)) ? Dx(r) : Dy(r)) / 2 - 4;
-	rad = (int)(rad * zoom);
+	/*
+	 * Re-render the static layer only when the view actually
+	 * changed.  Plenty of redraws (hover/selection changes,
+	 * status bar updates) leave clat/clon/zoom/r untouched, and
+	 * with a large coast.dat re-walking every point on every one
+	 * of those is the expensive part we don't need to repeat.
+	 */
+	if(!cachevalid || !eqrect(cacherect, r) ||
+	   clat != cclat || clon != cclon || zoom != czoom){
+		if(cache != nil)
+			freeimage(cache);
+		cache = allocimage(display, r, screen->chan, 0, DNofill);
+		if(cache == nil)
+			sysfatal("allocimage: %r");
 
-	/* background */
-	draw(dst, r, display->black, nil, ZP);
+		cx = (r.min.x + r.max.x) / 2;
+		cy = (r.min.y + r.max.y) / 2;
+		rad = ((Dx(r) < Dy(r)) ? Dx(r) : Dy(r)) / 2 - 4;
+		rad = (int)(rad * zoom);
 
-	/* globe disc */
-	fillellipse(dst, Pt(cx, cy), rad, rad, ocean, ZP);
+		/* background */
+		draw(cache, r, display->black, nil, ZP);
 
-	/* grid */
-	drawgrid(dst, r, clat, clon, zoom);
+		/* globe disc */
+		fillellipse(cache, Pt(cx, cy), rad, rad, ocean, ZP);
 
-	/* coastlines */
-	drawcoasts(dst, r, clat, clon, zoom);
+		/* grid */
+		drawgrid(cache, r, clat, clon, zoom);
 
-	/* globe border */
-	ellipse(dst, Pt(cx, cy), rad, rad, 1, coastcol, ZP);
+		/* coastlines */
+		drawcoasts(cache, r, clat, clon, zoom);
+
+		/* globe border */
+		ellipse(cache, Pt(cx, cy), rad, rad, 1, coastcol, ZP);
+
+		cacherect = r;
+		cclat = clat;
+		cclon = clon;
+		czoom = zoom;
+		cachevalid = 1;
+	}
+
+	draw(dst, r, cache, nil, r.min);
 }
 
 void

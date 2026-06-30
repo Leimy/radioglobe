@@ -155,15 +155,109 @@ loadfile(char *path)
 	return 0;
 }
 
+/*
+ * Compute the bounding cap for one already-vectorized coastline: a
+ * center direction and the cosine of the half-angle of the smallest
+ * cone around that center which contains all of the line's points.
+ *
+ * Method: average the unit vectors and renormalize to get a
+ * reasonable center direction (this is not necessarily the
+ * mathematically optimal cap center, but it doesn't need to be --
+ * any fixed center works as long as we then measure the true
+ * largest angle from it to any point, which is exactly what the
+ * second loop does).  capcos is the *minimum* dot product between
+ * the center and any point; since dot product decreases as angle
+ * increases, the minimum dot product corresponds to the point
+ * farthest from the center, i.e. exactly the half-angle we need.
+ *
+ * If the points are spread out enough that their vectors largely
+ * cancel (e.g. a polyline that wraps most of the way around the
+ * globe), the average has near-zero length and "center" stops being
+ * a meaningful direction.  In that case we disable culling for this
+ * polyline (capcos = -2, see dat.h) rather than risk wrongly
+ * skipping a polyline that does have a visible point on screen.
+ * That's a correctness fallback, not a bug: the per-point visibility
+ * test that already exists in drawcoasts() still renders such a
+ * polyline correctly -- we just lose the early-out for it.
+ */
+static void
+computecap(Coastline *c)
+{
+	int j;
+	double sx, sy, sz, len, d, mind;
+	Vec3 *v;
+
+	sx = sy = sz = 0;
+	for(j = 0; j < c->npts; j++){
+		sx += c->vec[j].x;
+		sy += c->vec[j].y;
+		sz += c->vec[j].z;
+	}
+	len = sqrt(sx*sx + sy*sy + sz*sz);
+	if(len < 1e-9){
+		c->center.x = c->center.y = c->center.z = 0;
+		c->capcos = -2;
+		return;
+	}
+	c->center.x = sx / len;
+	c->center.y = sy / len;
+	c->center.z = sz / len;
+
+	mind = 1;
+	for(j = 0; j < c->npts; j++){
+		v = &c->vec[j];
+		d = c->center.x*v->x + c->center.y*v->y + c->center.z*v->z;
+		if(d < mind)
+			mind = d;
+	}
+	c->capcos = mind;
+}
+
+/*
+ * Precompute a unit vector for every point of every coastline, plus
+ * a bounding cap per coastline (see computecap above).  This is the
+ * one-time cost that lets globe.c:
+ *   - project each point with a handful of multiply-adds per frame
+ *     instead of calling sin/cos/asin/atan2 on every point of every
+ *     redraw, and
+ *   - reject an entire far-side-of-the-globe polyline with one dot
+ *     product instead of projecting each of its points first.
+ * Both matter once coast.dat has hundreds of thousands of points;
+ * neither is needed at the few-hundred-point scale of the fallback
+ * outline, but doing it always keeps the code (and this file) simple.
+ */
+static void
+computevecs(void)
+{
+	int i, j;
+	Coastline *c;
+
+	for(i = 0; i < ncoast; i++){
+		c = &coasts[i];
+		c->vec = malloc(c->npts * sizeof(Vec3));
+		if(c->vec == nil)
+			sysfatal("malloc: %r");
+		for(j = 0; j < c->npts; j++)
+			geo2vec(c->pts[j], &c->vec[j]);
+		computecap(c);
+	}
+}
+
 void
 coastinit(void)
 {
+	int ok;
+
+	ok = 0;
 	if(coastpath != nil && loadfile(coastpath) == 0)
-		return;
-	if(loadfile("coast.dat") == 0)
-		return;
-	if(loadfile("/lib/radio/coast.dat") == 0)
-		return;
-	fprint(2, "radioglobe: no coast.dat found, using coarse outline\n");
-	usefallback();
+		ok = 1;
+	else if(loadfile("coast.dat") == 0)
+		ok = 1;
+	else if(loadfile("/lib/radio/coast.dat") == 0)
+		ok = 1;
+	if(!ok){
+		fprint(2, "radioglobe: no coast.dat found, using coarse outline\n");
+		usefallback();
+	}
+	computevecs();
 }
