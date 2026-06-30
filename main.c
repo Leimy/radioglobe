@@ -337,6 +337,7 @@ loadstations(char *path)
 		}
 		stations[nstation].geo.lat = atof(slat);
 		stations[nstation].geo.lon = atof(slon);
+		geo2vec(stations[nstation].geo, &stations[nstation].vec);
 		stations[nstation].name = strdup(name);
 		stations[nstation].url = strdup(url);
 		nstation++;

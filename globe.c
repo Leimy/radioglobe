@@ -327,11 +327,23 @@ globedraw(Image *dst, Rectangle r, double clat, double clon, double zoom)
 	 */
 	if(!cachevalid || !eqrect(cacherect, r) ||
 	   clat != cclat || clon != cclon || zoom != czoom){
-		if(cache != nil)
-			freeimage(cache);
-		cache = allocimage(display, r, screen->chan, 0, DNofill);
-		if(cache == nil)
-			sysfatal("allocimage: %r");
+		/*
+		 * Only (re)allocate the offscreen cache image when its
+		 * rectangle actually changes (i.e. a window resize).
+		 * Previously this freed and reallocated the image on
+		 * *every* call that reaches this branch, which includes
+		 * every mouse-motion event during a drag -- pure churn,
+		 * a round trip to the draw device to destroy and rebuild
+		 * an image of the very same size, every single frame.
+		 * Now we just draw fresh content into the same image.
+		 */
+		if(cache == nil || !eqrect(cacherect, r)){
+			if(cache != nil)
+				freeimage(cache);
+			cache = allocimage(display, r, screen->chan, 0, DNofill);
+			if(cache == nil)
+				sysfatal("allocimage: %r");
+		}
 
 		cx = (r.min.x + r.max.x) / 2;
 		cy = (r.min.y + r.max.y) / 2;
@@ -363,13 +375,33 @@ globedraw(Image *dst, Rectangle r, double clat, double clon, double zoom)
 	draw(dst, r, cache, nil, r.min);
 }
 
+/*
+ * Draw the station dots.  Like drawcoasts(), this projects each
+ * station's precomputed unit vector (Station.vec, set once at load
+ * time in main.c:loadstations() via geo2vec()) against a per-frame
+ * view basis (viewbasis()/vecproject()) instead of calling
+ * geo2screen()/project() -- i.e. sin/cos/asin/atan2 -- on every
+ * station on every redraw.  With a large station file (stations2)
+ * this matters exactly the same way it did for coast2.dat: the cost
+ * was proportional to "every station, every frame" regardless of
+ * how many are actually visible or selected.
+ */
 void
 drawstations(Image *dst, Rectangle r, double clat, double clon, double zoom,
 	Station *s, int ns, int sel)
 {
-	int i, vis, dotr;
+	int i, vis, dotr, cx, cy, rad;
+	double x, y;
 	Point p;
 	Image *col;
+	Vec3 ex, ey, ez;
+
+	cx = (r.min.x + r.max.x) / 2;
+	cy = (r.min.y + r.max.y) / 2;
+	rad = ((Dx(r) < Dy(r)) ? Dx(r) : Dy(r)) / 2 - 4;
+	rad = (int)(rad * zoom);
+
+	viewbasis(clat, clon, &ex, &ey, &ez);
 
 	dotr = 3;
 	if(zoom > 1.5)
@@ -378,9 +410,11 @@ drawstations(Image *dst, Rectangle r, double clat, double clon, double zoom,
 		dotr = 5;
 
 	for(i = 0; i < ns; i++){
-		geo2screen(r, clat, clon, zoom, s[i].geo, &p, &vis);
+		vecproject(&ex, &ey, &ez, s[i].vec, &x, &y, &vis);
 		if(!vis)
 			continue;
+		p.x = cx + (int)(x * rad);
+		p.y = cy - (int)(y * rad);
 		col = (i == sel) ? dotsel : dotcol;
 		fillellipse(dst, p, dotr, dotr, col, ZP);
 

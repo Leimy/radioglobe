@@ -280,6 +280,55 @@ equivalent culling at all yet (every station is projected every
 frame regardless of visibility), which may also be contributing at
 that station-count scale.
 
+### Two easy fixes landed (cache reuse + station vectors)
+
+Before tackling the tiling work above, fixed two cheap, contained
+issues found while reviewing the code for the momentum-spin change:
+
+1. **Cache image churn (globe.c:globedraw()).** The offscreen
+   `cache` image (see "Cached static layer" above) was being freed
+   and reallocated from scratch on *every* call where clat/clon/zoom
+   changed -- i.e. every single mouse-motion event during a drag,
+   regardless of dataset size. That's a round trip to the draw
+   device to destroy and rebuild an image of the same size, every
+   drag frame, for no reason (the rectangle essentially only changes
+   on window resize). Fixed: only free/realloc when the rectangle
+   itself changes; every other redraw now draws fresh content into
+   the same already-allocated image. No behavior change, pure
+   removed overhead, and it scales with drag-frame-rate rather than
+   dataset size, so it likely affected the coast2.dat+stations2
+   "chunky" feel mentioned above independent of the polyline-length
+   issue.
+
+2. **Station culling (globe.c:drawstations(), dat.h, main.c).**
+   Stations now get the same treatment coastlines already had:
+   Station gained a precomputed Vec3 `vec` field (dat.h), filled in
+   once per station at load time via geo2vec() (main.c:
+   loadstations()). drawstations() now computes the per-frame view
+   basis once (viewbasis()) and projects each station with
+   vecproject() against its precomputed vector -- a few dot products
+   -- instead of calling geo2screen()/project() (sin/cos/asin/atan2)
+   on every station on every redraw. Same win as the coastline
+   vector precompute, just applied to stations; matters once a
+   station file the size of stations2 is loaded.
+
+Both are pure performance changes with no behavior change (same
+dots, same visibility test, same hit-testing in main.c, which still
+uses the original geo2screen() path -- not yet touched, see below).
+
+Note: main.c:findstation() (used for both click hit-testing and
+hover-label lookups, called on basically every mouse-motion event
+even when not dragging) still loops over all stations calling the
+old geo2screen()/project() path. It wasn't touched in this round to
+keep the change small, but it's a natural follow-up using the same
+Station.vec infrastructure if hover lag is ever noticeable with
+stations2.
+
+Next: the coastline tiling/chunking work is still the big remaining
+item for coast2.dat-level detail (see above) -- these two fixes
+reduce constant overhead but don't change the fact that long
+polylines defeat the bounding-cap early-out.
+
 ## Momentum / inertial spin on drag release (IMPLEMENTED)
 
 Dragging the globe used to move it 1:1 with the mouse and stop

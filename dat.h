@@ -17,6 +17,7 @@ struct Station {
 	char *name;
 	char *url;
 	Geo geo;
+	Vec3 vec;	/* precomputed unit vector, set via geo2vec() at load time */
 };
 
 /* globe.c */
