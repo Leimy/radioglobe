@@ -329,6 +329,87 @@ item for coast2.dat-level detail (see above) -- these two fixes
 reduce constant overhead but don't change the fact that long
 polylines defeat the bounding-cap early-out.
 
+### Batched poly() draws (bigger fix, also landed)
+
+Realized the two fixes above (cache reuse, station vectors) don't
+touch what is likely the *actual* dominant cost at coast2.dat scale:
+drawcoasts() drew one line() call per line *segment* -- i.e. one
+draw-device protocol round trip per visible point-pair. The
+vector-precompute work earlier removed the per-point trig cost, but
+never touched this: a coastline polyline with thousands of on-screen
+points still cost thousands of separate protocol messages every
+redraw, no matter how cheap the projection math got. With
+hundreds of thousands of points in coast2.dat, this is plausibly a
+much bigger cost than the trig ever was, and tiling/chunking
+(splitting *which* polylines we walk) was never going to fix it,
+since it doesn't reduce the number of points actually drawn once a
+polyline (or chunk of one) is visible -- it only helps skip
+polylines that are entirely off-screen.
+
+Fix: draw(2) has poly(dst, p, np, end0, end1, radius, src, sp), which
+draws a whole connected polyline -- conceptually a series of line()
+calls -- in a *single* protocol message. drawcoasts() now accumulates
+each run of consecutive visible points into a buffer and issues one
+poly() call per run, instead of one line() call per segment. Same
+exact set of segments drawn (a segment only exists where both
+endpoints are visible, same as before), just batched.
+
+Caveat found while implementing: poly()'s wire format packs the
+point count as (np-1) into a 16-bit field (see
+/sys/src/libdraw/poly.c), so a single call tops out at 65536 points.
+Given the live concern that some coast2.dat polylines may be very
+long (whole continents), runs are chunked at Maxpolypts=8192 points
+per call, carrying the boundary point over into the next chunk so
+the connecting segment is still drawn. Comfortably under the 65536
+hard limit, and still a huge reduction in call count for anything
+that isn't already short.
+
+This is probably the single biggest lever available without
+inspecting coast2.dat's actual structure, since it attacks the
+"every visible point costs a protocol round trip" cost directly,
+independent of whether polylines happen to be long or short. The
+tiling/chunking idea above is still worth doing too (it reduces
+*work* for polylines that turn out to be entirely off-screen, which
+poly-batching doesn't help with at all), but this should be tried
+first and re-evaluated before investing in tiling.
+
+Not yet done: the same per-segment line() pattern exists in
+drawgrid() (lat/lon grid lines), but at ~1500 total points across
+the whole grid it is nowhere near the cost coastlines were, so left
+alone for now.
+
+### Known minor issue: 'q' feels delayed while momentum spin is active
+
+Observed during testing with coast2.dat/stations2: pressing 'q' (or
+any key) to quit while the inertial spin (see "Momentum / inertial
+spin" above) is still decaying seems to wait for the spin to finish
+before taking effect. Not fixed yet (flagged as low priority), but
+worth recording the likely cause and fix so it isn't rediscovered
+from scratch:
+
+event(2)'s multiplexer (/sys/src/libdraw/event.c) gives each input
+source a fixed priority by its key's bit position -- mouse(1) is
+slave 0, keyboard(2) is slave 1, our timer(4, see Etick in main.c) is
+slave 2 -- and always returns the lowest-index source with data
+ready, so keyboard does outrank the timer in principle. The catch:
+the raw event pipe is only drained (extract()) when the main loop
+calls back into event(), and our Etick case runs redraw() fully and
+synchronously before looping back. At coast2.dat/stations2 scale,
+even after the poly()-batching fix above, a single redraw is not
+free; while it's in flight, an arriving keypress just sits buffered
+in the pipe, unseen, until that redraw call returns. During an
+active fast spin, ticks keep arriving every ~25ms and each one
+retriggers another redraw, so a keystroke can keep "just missing its
+turn" against a steady stream of new ticks -- giving the impression
+input is locked out until the spin fully decays, even though no
+single redraw takes anywhere near that long.
+
+Likely fix (not yet implemented): at the top of `case Etick:` in
+main.c, check `ecankbd()` (see event(2)) and `break` (skip this
+tick's redraw) if a keystroke is already waiting, so the loop gets
+back to event() immediately instead of doing another redraw first.
+Should be a small, low-risk, self-contained change in main.c.
+
 ## Momentum / inertial spin on drag release (IMPLEMENTED)
 
 Dragging the globe used to move it 1:1 with the mouse and stop

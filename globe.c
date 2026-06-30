@@ -260,12 +260,29 @@ capvisible(Coastline *c, Vec3 *ez)
 	return dot > -sqrt(s2);
 }
 
+enum {
+	/*
+	 * poly()'s wire-protocol point count is a 16-bit field --
+	 * see /sys/src/libdraw/poly.c: BPSHORT(a+5, np-1) -- so a
+	 * single poly() call cannot encode more than 65536 points.
+	 * Chunk well under that limit so unusually long coastline
+	 * runs (plausible: NOTES.md flags that some Natural Earth
+	 * polylines may span whole continents rather than per-island
+	 * segments) still get batched into a handful of calls instead
+	 * of silently overflowing the 16-bit field. The point at the
+	 * chunk boundary is repeated as the first point of the next
+	 * chunk so the connecting line segment is still drawn (poly's
+	 * lines join adjacent points in its array).
+	 */
+	Maxpolypts = 8192,
+};
+
 static void
 drawcoasts(Image *dst, Rectangle r, double clat, double clon, double zoom)
 {
-	int i, j, vis, prevvis, cx, cy, rad;
+	static Point runbuf[Maxpolypts];
+	int i, j, vis, cx, cy, rad, nrun;
 	double x, y;
-	Point p, prev;
 	Vec3 ex, ey, ez;
 	Coastline *c;
 
@@ -294,16 +311,40 @@ drawcoasts(Image *dst, Rectangle r, double clat, double clon, double zoom)
 		if(!capvisible(c, &ez))
 			continue;
 
-		prevvis = 0;
+		/*
+		 * Accumulate runs of consecutive visible points and
+		 * draw each run with a single poly() call instead of
+		 * one line() protocol message per segment. This draws
+		 * exactly the same segments the old per-segment code
+		 * did (a segment only when both its endpoints are
+		 * visible) -- just batched. A polyline with thousands
+		 * of on-screen points used to cost thousands of
+		 * separate draw-device round trips every redraw (even
+		 * after the vector-precompute optimization, which only
+		 * removed the per-point trig, not the per-point draw
+		 * call); now it costs one call per visible run, or a
+		 * handful if a run is longer than Maxpolypts.
+		 */
+		nrun = 0;
 		for(j = 0; j < c->npts; j++){
 			vecproject(&ex, &ey, &ez, c->vec[j], &x, &y, &vis);
-			p.x = cx + (int)(x * rad);
-			p.y = cy - (int)(y * rad);
-			if(vis && prevvis)
-				line(dst, prev, p, Endsquare, Endsquare, 0, coastcol, ZP);
-			prev = p;
-			prevvis = vis;
+			if(!vis){
+				if(nrun > 1)
+					poly(dst, runbuf, nrun, Endsquare, Endsquare, 0, coastcol, ZP);
+				nrun = 0;
+				continue;
+			}
+			runbuf[nrun].x = cx + (int)(x * rad);
+			runbuf[nrun].y = cy - (int)(y * rad);
+			nrun++;
+			if(nrun == Maxpolypts){
+				poly(dst, runbuf, nrun, Endsquare, Endsquare, 0, coastcol, ZP);
+				runbuf[0] = runbuf[nrun-1];
+				nrun = 1;
+			}
 		}
+		if(nrun > 1)
+			poly(dst, runbuf, nrun, Endsquare, Endsquare, 0, coastcol, ZP);
 	}
 }
 
