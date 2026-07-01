@@ -2,6 +2,7 @@
 #include <libc.h>
 #include <bio.h>
 #include <json.h>
+#include "util.h"
 
 /*
  * mkcoast - convert a Natural Earth coastline GeoJSON file
@@ -23,38 +24,6 @@
  */
 
 Biobuf *bout;
-
-static char *
-readall(int fd)
-{
-	char *buf;
-	long n, sz, tot;
-
-	sz = 1<<20;
-	buf = malloc(sz);
-	if(buf == nil)
-		sysfatal("malloc: %r");
-	tot = 0;
-	for(;;){
-		if(tot >= sz){
-			sz *= 2;
-			buf = realloc(buf, sz);
-			if(buf == nil)
-				sysfatal("realloc: %r");
-		}
-		n = read(fd, buf+tot, sz-tot);
-		if(n < 0)
-			sysfatal("read: %r");
-		if(n == 0)
-			break;
-		tot += n;
-	}
-	buf = realloc(buf, tot+1);
-	if(buf == nil)
-		sysfatal("realloc: %r");
-	buf[tot] = 0;
-	return buf;
-}
 
 /* count points in a LineString (array of [lon,lat] arrays) */
 static int

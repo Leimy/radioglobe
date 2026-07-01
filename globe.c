@@ -44,6 +44,28 @@ globeinit(void)
 }
 
 /*
+ * Screen geometry for a globe drawn in rectangle r at a given zoom:
+ * disc center (cx, cy) and radius rad in pixels.  This used to be
+ * open-coded in half a dozen places (projection, drawing, hit
+ * testing, and the drag handler in main.c), which is exactly how
+ * the drag handler ended up disagreeing with the renderer about
+ * which rectangle to measure.  One definition, used everywhere.
+ */
+void
+globegeom(Rectangle r, double zoom, int *cx, int *cy, int *rad)
+{
+	int rr;
+
+	*cx = (r.min.x + r.max.x) / 2;
+	*cy = (r.min.y + r.max.y) / 2;
+	rr = ((Dx(r) < Dy(r)) ? Dx(r) : Dy(r)) / 2 - 4;
+	rr = (int)(rr * zoom);
+	if(rr < 1)
+		rr = 1;
+	*rad = rr;
+}
+
+/*
  * Convert a Geo to a unit vector on the sphere.  Uses PI directly
  * (not the file-scope dtor) because this is called from coast.c
  * during coastinit(), which runs before globeinit() sets dtor.
@@ -125,53 +147,10 @@ geo2screen(Rectangle r, double clat, double clon, double zoom, Geo g, Point *p, 
 	double x, y;
 	int cx, cy, rad;
 
-	cx = (r.min.x + r.max.x) / 2;
-	cy = (r.min.y + r.max.y) / 2;
-	rad = ((Dx(r) < Dy(r)) ? Dx(r) : Dy(r)) / 2 - 4;
-	rad = (int)(rad * zoom);
-
+	globegeom(r, zoom, &cx, &cy, &rad);
 	project(clat, clon, g, &x, &y, visible);
 	p->x = cx + (int)(x * rad);
 	p->y = cy - (int)(y * rad);
-}
-
-int
-globehit(Rectangle r, double clat, double clon, double zoom, Point xy, Geo *g)
-{
-	int cx, cy, rad;
-	double x, y, rho;
-	double sinc, cosc;
-	double clat0, slat0;
-	double lat, lon;
-
-	cx = (r.min.x + r.max.x) / 2;
-	cy = (r.min.y + r.max.y) / 2;
-	rad = ((Dx(r) < Dy(r)) ? Dx(r) : Dy(r)) / 2 - 4;
-	rad = (int)(rad * zoom);
-
-	x = (double)(xy.x - cx) / rad;
-	y = (double)(cy - xy.y) / rad;
-	rho = sqrt(x*x + y*y);
-	if(rho > 1.0)
-		return 0;
-
-	clat0 = clat * dtor;
-	slat0 = sin(clat0);
-	clat0 = cos(clat0);
-
-	sinc = sin(asin(rho));  /* == rho, but clearer */
-	cosc = cos(asin(rho));
-
-	lat = asin(cosc * slat0 + y * sinc * clat0 / rho);
-	lon = clon * dtor + atan2(x * sinc, rho * clat0 * cosc - y * slat0 * sinc);
-
-	g->lat = lat / dtor;
-	g->lon = lon / dtor;
-	/* normalize longitude */
-	while(g->lon > 180.0) g->lon -= 360.0;
-	while(g->lon < -180.0) g->lon += 360.0;
-
-	return 1;
 }
 
 static void
@@ -286,10 +265,7 @@ drawcoasts(Image *dst, Rectangle r, double clat, double clon, double zoom)
 	Vec3 ex, ey, ez;
 	Coastline *c;
 
-	cx = (r.min.x + r.max.x) / 2;
-	cy = (r.min.y + r.max.y) / 2;
-	rad = ((Dx(r) < Dy(r)) ? Dx(r) : Dy(r)) / 2 - 4;
-	rad = (int)(rad * zoom);
+	globegeom(r, zoom, &cx, &cy, &rad);
 
 	/* computed once per call, not once per point */
 	viewbasis(clat, clon, &ex, &ey, &ez);
@@ -386,10 +362,7 @@ globedraw(Image *dst, Rectangle r, double clat, double clon, double zoom)
 				sysfatal("allocimage: %r");
 		}
 
-		cx = (r.min.x + r.max.x) / 2;
-		cy = (r.min.y + r.max.y) / 2;
-		rad = ((Dx(r) < Dy(r)) ? Dx(r) : Dy(r)) / 2 - 4;
-		rad = (int)(rad * zoom);
+		globegeom(r, zoom, &cx, &cy, &rad);
 
 		/* background */
 		draw(cache, r, display->black, nil, ZP);
@@ -416,6 +389,17 @@ globedraw(Image *dst, Rectangle r, double clat, double clon, double zoom)
 	draw(dst, r, cache, nil, r.min);
 }
 
+/* station dot radius in pixels, grows a little with zoom */
+static int
+dotradius(double zoom)
+{
+	if(zoom > 3.0)
+		return 5;
+	if(zoom > 1.5)
+		return 4;
+	return 3;
+}
+
 /*
  * Draw the station dots.  Like drawcoasts(), this projects each
  * station's precomputed unit vector (Station.vec, set once at load
@@ -437,18 +421,9 @@ drawstations(Image *dst, Rectangle r, double clat, double clon, double zoom,
 	Image *col;
 	Vec3 ex, ey, ez;
 
-	cx = (r.min.x + r.max.x) / 2;
-	cy = (r.min.y + r.max.y) / 2;
-	rad = ((Dx(r) < Dy(r)) ? Dx(r) : Dy(r)) / 2 - 4;
-	rad = (int)(rad * zoom);
-
+	globegeom(r, zoom, &cx, &cy, &rad);
 	viewbasis(clat, clon, &ex, &ey, &ez);
-
-	dotr = 3;
-	if(zoom > 1.5)
-		dotr = 4;
-	if(zoom > 3.0)
-		dotr = 5;
+	dotr = dotradius(zoom);
 
 	for(i = 0; i < ns; i++){
 		vecproject(&ex, &ey, &ez, s[i].vec, &x, &y, &vis);
@@ -467,4 +442,43 @@ drawstations(Image *dst, Rectangle r, double clat, double clon, double zoom,
 			string(dst, tp, textcol, ZP, font, s[i].name);
 		}
 	}
+}
+
+/*
+ * Find the station nearest to screen point xy, or -1 if none is
+ * close enough.  Used by main.c for both click hit-testing and the
+ * hover label, i.e. it runs on essentially every mouse-motion
+ * event, so it uses the same precomputed-vector projection as
+ * drawstations() instead of the trig-per-station geo2screen() path.
+ * The hit radius tracks the drawn dot size so targets don't get
+ * relatively harder to click as dots grow with zoom.
+ */
+int
+stationhit(Rectangle r, double clat, double clon, double zoom, Point xy,
+	Station *s, int ns)
+{
+	int i, vis, cx, cy, rad, px, py, best, bestd, maxd, d;
+	double x, y;
+	Vec3 ex, ey, ez;
+
+	globegeom(r, zoom, &cx, &cy, &rad);
+	viewbasis(clat, clon, &ex, &ey, &ez);
+
+	maxd = 12 + dotradius(zoom);	/* max click distance, pixels */
+	best = -1;
+	bestd = maxd*maxd;
+
+	for(i = 0; i < ns; i++){
+		vecproject(&ex, &ey, &ez, s[i].vec, &x, &y, &vis);
+		if(!vis)
+			continue;
+		px = cx + (int)(x * rad);
+		py = cy - (int)(y * rad);
+		d = (px - xy.x)*(px - xy.x) + (py - xy.y)*(py - xy.y);
+		if(d < bestd){
+			bestd = d;
+			best = i;
+		}
+	}
+	return best;
 }

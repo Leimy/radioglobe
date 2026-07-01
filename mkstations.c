@@ -2,6 +2,7 @@
 #include <libc.h>
 #include <bio.h>
 #include <json.h>
+#include "util.h"
 
 /*
  * mkstations - convert radio-browser.info JSON into
@@ -33,38 +34,6 @@
 Biobuf *bout;
 int keepall;
 int minbitrate;
-
-static char *
-readall(int fd)
-{
-	char *buf;
-	long n, sz, tot;
-
-	sz = 1<<20;
-	buf = malloc(sz);
-	if(buf == nil)
-		sysfatal("malloc: %r");
-	tot = 0;
-	for(;;){
-		if(tot >= sz){
-			sz *= 2;
-			buf = realloc(buf, sz);
-			if(buf == nil)
-				sysfatal("realloc: %r");
-		}
-		n = read(fd, buf+tot, sz-tot);
-		if(n < 0)
-			sysfatal("read: %r");
-		if(n == 0)
-			break;
-		tot += n;
-	}
-	buf = realloc(buf, tot+1);
-	if(buf == nil)
-		sysfatal("realloc: %r");
-	buf[tot] = 0;
-	return buf;
-}
 
 /* json value -> number, with default if missing/not a number */
 static double
@@ -204,6 +173,13 @@ emitstation(JSON *o)
 	return 1;
 }
 
+static void
+usage(void)
+{
+	fprint(2, "usage: %s [-a] [-b minbitrate] < stations.json > stations\n", argv0);
+	exits("usage");
+}
+
 void
 main(int argc, char **argv)
 {
@@ -220,13 +196,10 @@ main(int argc, char **argv)
 		keepall = 1;
 		break;
 	case 'b':
-		minbitrate = atoi(EARGF(fprint(2,
-			"usage: %s [-a] [-b minbitrate] < stations.json > stations\n",
-			argv0)));
+		minbitrate = atoi(EARGF(usage()));
 		break;
 	default:
-		fprint(2, "usage: %s [-a] [-b minbitrate] < stations.json > stations\n", argv0);
-		exits("usage");
+		usage();
 	}ARGEND
 	USED(argc); USED(argv);
 

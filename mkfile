@@ -14,8 +14,7 @@ GLOBEOFILES=\
 
 HFILES=\
 	dat.h\
-
-CLEANFILES=$TARG
+	util.h\
 
 default:V: all
 
@@ -24,11 +23,11 @@ all:V: $TARG
 radioglobe: $GLOBEOFILES
 	$LD -o $target $GLOBEOFILES
 
-mkcoast: mkcoast.$O
-	$LD -o $target mkcoast.$O -ljson
+mkcoast: mkcoast.$O util.$O
+	$LD -o $target mkcoast.$O util.$O -ljson
 
-mkstations: mkstations.$O
-	$LD -o $target mkstations.$O -ljson
+mkstations: mkstations.$O util.$O
+	$LD -o $target mkstations.$O util.$O -ljson
 
 %.$O: %.c $HFILES
 	$CC $CFLAGS $stem.c
@@ -38,8 +37,8 @@ install:V: $TARG
 
 installdata:V:
 	mkdir -p /lib/radio
-	test -f stations && cp stations /lib/radio/stations
-	test -f coast.dat && cp coast.dat /lib/radio/coast.dat
+	if(test -f stations) cp stations /lib/radio/stations
+	if(test -f coast.dat) cp coast.dat /lib/radio/coast.dat
 
 clean:V:
-	rm -f *.[$OS] [$OS].out $TARG $CLEANFILES
+	rm -f *.[$OS] [$OS].out $TARG

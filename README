@@ -136,4 +136,5 @@ SOURCE
 	dat.h          shared types
 	mkcoast.c      GeoJSON coastline -> coast.dat
 	mkstations.c   radio-browser JSON -> stations
+	util.c         helpers shared by the converters
 	NOTES.md       project notes / how to resume work

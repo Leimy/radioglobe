@@ -248,8 +248,15 @@ coastinit(void)
 	int ok;
 
 	ok = 0;
-	if(coastpath != nil && loadfile(coastpath) == 0)
+	if(coastpath != nil){
+		/*
+		 * the user named this file explicitly (-c); failing
+		 * loudly beats silently falling back to different data.
+		 */
+		if(loadfile(coastpath) != 0)
+			sysfatal("cannot load coastline file %s", coastpath);
 		ok = 1;
+	}
 	else if(loadfile("coast.dat") == 0)
 		ok = 1;
 	else if(loadfile("/lib/radio/coast.dat") == 0)

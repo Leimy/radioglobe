@@ -183,6 +183,7 @@ one per line.
     dat.h         shared types
     mkcoast.c     GeoJSON coastline -> coast.dat
     mkstations.c  radio-browser JSON -> stations
+    util.c/util.h readall(), shared by the two converters
     stations      station list (generated, sample committed)
     coast.dat     coastline data (generated)
     README        user-facing docs
@@ -536,6 +537,65 @@ needed in globe.c/coast.c; this is a self-contained main.c feature.
   written, just needs to be reachable from the timer case too),
   and the render cache (already invalidates correctly on any
   clat/clon change, momentum-driven or not).
+
+## Review fixes round (landed)
+
+A code-review pass fixed a batch of small bugs and cleanups in
+one go (deliberately NOT addressing stream-death detection --
+if the radio goes silent, the listener notices; not worth the
+plumbing):
+
+- **Reload leak (main.c:loadstations()):** freed the stations
+  array but never the strduped name/url strings; every menu
+  "reload" leaked the whole string set.  Now frees them first.
+- **Antimeridian flick spike (main.c drag handler):** vlon was
+  computed from already-normalized clon, so dragging across
+  +-180 made the delta ~360 deg and a release there launched
+  the globe at absurd speed.  The delta is now wrapped into
+  [-180,180] before dividing by dt.
+- **Stale `playing` after reload:** menu reload now stops the
+  stream; station indices are meaningless across a reload and
+  the status bar could name the wrong station.
+- **globehit() removed (globe.c, dat.h):** dead code (nothing
+  called it) with a latent divide-by-zero at rho==0 (click dead
+  center).  Delete rather than fix; resurrect from git if a
+  "click ocean to recenter" feature ever wants it.
+- **globegeom() helper (globe.c, dat.h):** the cx/cy/rad disc
+  geometry was open-coded in ~6 places.  Now one function.
+  This also fixed a real desync: the drag handler measured
+  screen->r while the renderer measures globerect() (screen
+  minus status bar), so drag didn't track the cursor exactly
+  1:1.  Both now use globegeom(globerect(), ...).
+- **stationhit() (globe.c):** findstation() (hover + click, runs
+  per mouse-motion event) now uses the precomputed Station.vec /
+  viewbasis/vecproject path like drawstations(), instead of
+  trig-per-station geo2screen().  This closes the "natural
+  follow-up" flagged in the earlier perf notes.  Hit radius now
+  tracks dot size (12+dotradius(zoom)) instead of fixed 15px.
+- **Scroll chord edge bug (main.c):** the scroll-wheel cases
+  broke out of the Emouse case before oldbuttons was updated,
+  so a chorded scroll+button event could double-trigger button
+  edge detection.  oldbuttons is now updated on those paths.
+- **coastinit() (-c failure):** an explicitly named -c file that
+  fails to load is now sysfatal instead of silently falling back
+  to ./coast.dat / /lib/radio/coast.dat.
+- **mkstations -b error path:** EARGF(fprint(...)) aborted (the
+  ARGBEGIN macro calls abort() after the expression) instead of
+  exiting cleanly; now a proper usage() like main.c has.
+- **Shared readall():** identical function was duplicated in
+  mkcoast.c and mkstations.c; moved to util.c/util.h, linked
+  into both converters (mkfile updated).
+- **mkfile nits:** CLEANFILES=$TARG made clean delete the same
+  files twice (dropped); installdata's `test -f x && cp ...`
+  made the recipe FAIL when a data file was merely absent --
+  now `if(test -f x) cp ...` (optional means optional).
+- **Alloc checks:** strdup/quotestrdup results in main.c are now
+  checked (sysfatal), consistent with the rest of the file.
+
+Gotcha worth remembering: `mk clean all` in ONE invocation can
+fail -- mk stats object files before clean deletes them, decides
+they're up to date, then the link step can't find them.  Run
+`mk clean` and `mk` as separate invocations.
 
 ## TODO / ideas
 

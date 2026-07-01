@@ -122,6 +122,8 @@ startstream(int idx)
 	 * RFNOWAIT: don't block the parent.
 	 */
 	qurl = quotestrdup(stations[idx].url);
+	if(qurl == nil)
+		sysfatal("quotestrdup: %r");
 	snprint(cmd, sizeof cmd,
 		"play -o /fd/1 %s </dev/null | "
 		"audio/pcmconv -o s16c2r%d >/dev/audio",
@@ -164,25 +166,7 @@ globerect(void)
 static int
 findstation(Point xy)
 {
-	Rectangle gr;
-	int i, vis, best, bestd, d;
-	Point p;
-
-	gr = globerect();
-	best = -1;
-	bestd = 15*15; /* max click distance squared, in pixels */
-
-	for(i = 0; i < nstation; i++){
-		geo2screen(gr, clat, clon, zoom, stations[i].geo, &p, &vis);
-		if(!vis)
-			continue;
-		d = (p.x - xy.x)*(p.x - xy.x) + (p.y - xy.y)*(p.y - xy.y);
-		if(d < bestd){
-			bestd = d;
-			best = i;
-		}
-	}
-	return best;
+	return stationhit(globerect(), clat, clon, zoom, xy, stations, nstation);
 }
 
 static char *
@@ -225,6 +209,11 @@ loadstations(char *path)
 	}
 	buf[n] = 0;
 
+	/* free the old list, including the strduped strings */
+	for(n = 0; n < nstation; n++){
+		free(stations[n].name);
+		free(stations[n].url);
+	}
 	free(stations);
 	stations = nil;
 	nstation = 0;
@@ -302,6 +291,8 @@ loadstations(char *path)
 		geo2vec(stations[nstation].geo, &stations[nstation].vec);
 		stations[nstation].name = strdup(name);
 		stations[nstation].url = strdup(url);
+		if(stations[nstation].name == nil || stations[nstation].url == nil)
+			sysfatal("strdup: %r");
 		nstation++;
 	}
 	free(buf);
@@ -380,7 +371,7 @@ main(int argc, char **argv)
 	int e, dragging, oldbuttons;
 	Point dragstart;
 	double dragclat, dragclon;
-	int rad;
+	int cx, cy, rad;
 	char *stationfile, *cfile;
 
 	stationfile = "/lib/radio/stations";
@@ -433,17 +424,24 @@ main(int argc, char **argv)
 		case Emouse:
 			m = ev.mouse;
 
-			/* scroll wheel zoom */
+			/*
+			 * scroll wheel zoom; keep oldbuttons up to date
+			 * even on this early exit, so a chorded
+			 * scroll+button event can't retrigger the
+			 * button edge detection below on the next event.
+			 */
 			if(m.buttons & 8){
 				zoom *= 1.15;
 				if(zoom > zoommax) zoom = zoommax;
 				redraw();
+				oldbuttons = m.buttons;
 				break;
 			}
 			if(m.buttons & 16){
 				zoom /= 1.15;
 				if(zoom < zoommin) zoom = zoommin;
 				redraw();
+				oldbuttons = m.buttons;
 				break;
 			}
 
@@ -462,9 +460,13 @@ main(int argc, char **argv)
 					lastmsec = m.msec;
 				}
 				if(dragging){
-					rad = ((Dx(screen->r) < Dy(screen->r)) ? Dx(screen->r) : Dy(screen->r)) / 2 - 4;
-					rad = (int)(rad * zoom);
-					if(rad < 1) rad = 1;
+					/*
+					 * use the same geometry the renderer
+					 * uses (globerect(), which excludes the
+					 * status bar) so dragging tracks the
+					 * cursor exactly 1:1.
+					 */
+					globegeom(globerect(), zoom, &cx, &cy, &rad);
 
 					clon = dragclon - (double)(m.xy.x - dragstart.x) * 180.0 / rad;
 					clat = dragclat + (double)(m.xy.y - dragstart.y) * 180.0 / rad;
@@ -480,8 +482,19 @@ main(int argc, char **argv)
 					 */
 					if(m.msec > lastmsec){
 						double dt = m.msec - lastmsec;
+						/*
+						 * clon has already been normalized
+						 * into [-180,180]; crossing the
+						 * antimeridian makes the raw delta
+						 * ~+-360, which would launch the
+						 * globe at absurd speed on release.
+						 * Wrap the delta first.
+						 */
+						double dlon = clon - lastclon;
+						while(dlon > 180.0) dlon -= 360.0;
+						while(dlon < -180.0) dlon += 360.0;
 						vlat = (clat - lastclat) / dt;
-						vlon = (clon - lastclon) / dt;
+						vlon = dlon / dt;
 						lastclat = clat;
 						lastclon = clon;
 						lastmsec = m.msec;
@@ -516,6 +529,13 @@ main(int argc, char **argv)
 					stopstream();
 					break;
 				case Mreload:
+					/*
+					 * indices into stations[] are meaningless
+					 * across a reload; stopping the stream is
+					 * less surprising than a status bar that
+					 * names the wrong station.
+					 */
+					stopstream();
 					loadstations(stationfile);
 					selstation = -1;
 					break;
