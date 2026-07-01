@@ -49,7 +49,6 @@ double clat = 30.0;
 double clon = 0.0;
 double zoom = 1.0;
 double zoommin = 0.5;
-//double zoommax = 8.0;
 double zoommax = 128.0;
 
 /*
@@ -93,36 +92,11 @@ stopstream(void)
 	playing = -1;
 }
 
-/*
- * quote a string for safe inclusion inside rc single quotes.
- * rc quoting: wrap in '...' and double any embedded '.
- * writes into dst (size dlen); returns dst.
- */
-static char *
-rcquote(char *dst, int dlen, char *s)
-{
-	char *d, *e;
-
-	d = dst;
-	e = dst + dlen - 1;
-	if(d < e) *d++ = '\'';
-	for(; *s && d < e; s++){
-		if(*s == '\''){
-			if(d < e) *d++ = '\'';
-			if(d < e) *d++ = '\'';
-		} else
-			*d++ = *s;
-	}
-	if(d < e) *d++ = '\'';
-	*d = 0;
-	return dst;
-}
-
 static void
 startstream(int idx)
 {
 	int pid;
-	char qurl[2048];
+	char *qurl;
 	char cmd[4096];
 
 	stopstream();
@@ -142,30 +116,22 @@ startstream(int idx)
 	 * a decoder emitting 48000Hz into a 44100Hz device plays ~9%
 	 * fast; pcmconv converts the rate so it always matches.
 	 *
-	 * RFFDG: child gets its own fd table so its redirects can't
-	 *   clobber the GUI's fds.
+	 * RFCFDG: child has independent, clean file descriptor table
 	 * RFNOTEG: new note group so postnote(PNGROUP) kills the whole
 	 *   pipeline (play, hget, decoder, pcmconv).
 	 * RFNOWAIT: don't block the parent.
 	 */
-	rcquote(qurl, sizeof qurl, stations[idx].url);
+	qurl = quotestrdup(stations[idx].url);
 	snprint(cmd, sizeof cmd,
 		"play -o /fd/1 %s </dev/null | "
 		"audio/pcmconv -o s16c2r%d >/dev/audio",
 		qurl, devrate);
+	free(qurl);
 
-	pid = rfork(RFPROC|RFFDG|RFNOTEG|RFNOWAIT);
+	pid = rfork(RFPROC|RFCFDG|RFNOTEG|RFNOWAIT);
 	if(pid == 0){
-		int fd, nfd;
+		int nfd;
 
-		/* close draw device fds and other clutter */
-		for(fd = 3; fd < 30; fd++)
-			close(fd);
-
-		/* sane 0/1/2 for rc; errors to console */
-		close(0);
-		close(1);
-		close(2);
 		nfd = open("/dev/null", OREAD);		/* 0 */
 		if(nfd != 0 && nfd >= 0){ dup(nfd, 0); close(nfd); }
 		nfd = open("/dev/null", OWRITE);	/* 1 */
@@ -222,9 +188,7 @@ findstation(Point xy)
 static char *
 skipws(char *s)
 {
-	while(*s == ' ' || *s == '\t')
-		s++;
-	return s;
+	return s + strspn(s, " \t");
 }
 
 static int
@@ -276,12 +240,12 @@ loadstations(char *path)
 
 		/* parse: lat lon "name" url */
 		slat = s;
-		while(*s && *s != ' ' && *s != '\t') s++;
+		s += strcspn(s, " \t");
 		if(*s) *s++ = 0;
 		s = skipws(s);
 
 		slon = s;
-		while(*s && *s != ' ' && *s != '\t') s++;
+		s += strcspn(s, " \t");
 		if(*s) *s++ = 0;
 		s = skipws(s);
 
@@ -302,12 +266,10 @@ loadstations(char *path)
 			last = nil;
 			for(t = s; *t; t++){
 				if(*t == ' ' || *t == '\t'){
-					u = t;
-					while(*u == ' ' || *u == '\t') u++;
+					u = t + strspn(t, " \t");
 					if(*u){
-						v = u;
-						while(*v && *v != ' ' && *v != '\t') v++;
-						while(*v == ' ' || *v == '\t') v++;
+						v = u + strcspn(u, " \t");
+						v += strspn(v, " \t");
 						if(!*v){
 							last = t;
 							break;

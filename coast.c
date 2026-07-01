@@ -101,8 +101,7 @@ loadfile(char *path)
 
 	while((ln = Brdline(b, '\n')) != nil){
 		ln[Blinelen(b)-1] = 0;
-		while(*ln == ' ' || *ln == '\t')
-			ln++;
+		ln += strspn(ln, " \t");
 		if(*ln == '#' || *ln == 0)
 			continue;
 
