@@ -3,6 +3,7 @@
 #include <draw.h>
 #include <event.h>
 #include <keyboard.h>
+#include "view.h"
 #include "dat.h"
 
 /*
@@ -45,26 +46,7 @@ char *menuitems[] = {
 
 Menu menu = { menuitems };
 
-double clat = 30.0;
-double clon = 0.0;
-double zoom = 1.0;
-double zoommin = 0.5;
-double zoommax = 128.0;
-
-/*
- * Momentum/inertial spin: vlat/vlon are the current angular
- * velocity in degrees per millisecond, tracked continuously while
- * dragging (see Emouse handling) and consumed on each Etick once
- * the button is released.  friction decays the velocity each tick;
- * vmin is the speed below which we consider the spin stopped (and
- * stop ticking redraw).
- */
-double vlat = 0.0;
-double vlon = 0.0;
-double lastclat, lastclon;
-ulong lastmsec;
-double friction = 0.92;
-double vmin = 0.0005;
+Orbit orb;
 
 Station *stations;
 int nstation;
@@ -72,6 +54,7 @@ int selstation = -1;
 int playing = -1;
 int streampid = -1;
 Image *statbg;
+static Image *back;	/* offscreen frame buffer; whole frame is composed here */
 
 /*
  * Output sample rate for the audio device, in Hz.  The standard
@@ -166,7 +149,7 @@ globerect(void)
 static int
 findstation(Point xy)
 {
-	return stationhit(globerect(), clat, clon, zoom, xy, stations, nstation);
+	return stationhit(globerect(), orb.pitch, orb.yaw, orb.zoom, xy, stations, nstation);
 }
 
 static char *
@@ -312,7 +295,7 @@ drawstatusbar(void)
 	r.max.y = screen->r.max.y;
 	r.min.y = r.max.y - h;
 
-	draw(screen, r, statbg ? statbg : display->black, nil, ZP);
+	draw(back, r, statbg ? statbg : display->black, nil, ZP);
 
 	p = Pt(r.min.x + 6, r.min.y + 4);
 
@@ -331,9 +314,9 @@ drawstatusbar(void)
 			stations[selstation].geo.lon);
 	else
 		snprint(buf, sizeof buf, "  [%.1f, %.1f]  zoom %.1fx",
-			clat, clon, zoom);
+			orb.pitch, orb.yaw, orb.zoom);
 
-	string(screen, p, display->white, ZP, font, buf);
+	string(back, p, display->white, ZP, font, buf);
 }
 
 static void
@@ -341,10 +324,26 @@ redraw(void)
 {
 	Rectangle gr;
 
+	/*
+	 * Compose the whole frame offscreen, then blit it to the
+	 * window in one draw.  Drawing straight to screen flickers
+	 * at large station counts: libdraw's command buffer fills
+	 * up mid-frame and each auto-flush exposes a half-drawn
+	 * frame.  back shares screen's coordinate system, so all
+	 * screen->r-based geometry stays valid.
+	 */
+	if(back == nil || !eqrect(back->r, screen->r)){
+		freeimage(back);
+		back = allocimage(display, screen->r, screen->chan, 0, DNofill);
+		if(back == nil)
+			sysfatal("allocimage: %r");
+	}
+
 	gr = globerect();
-	globedraw(screen, gr, clat, clon, zoom);
-	drawstations(screen, gr, clat, clon, zoom, stations, nstation, selstation);
+	globedraw(back, gr, orb.pitch, orb.yaw, orb.zoom);
+	drawstations(back, gr, orb.pitch, orb.yaw, orb.zoom, stations, nstation, selstation);
 	drawstatusbar();
+	draw(screen, screen->r, back, nil, screen->r.min);
 	flushimage(display, 1);
 }
 
@@ -368,9 +367,7 @@ main(int argc, char **argv)
 {
 	Event ev;
 	Mouse m;
-	int e, dragging, oldbuttons;
-	Point dragstart;
-	double dragclat, dragclon;
+	int e, oldbuttons;
 	int cx, cy, rad;
 	char *stationfile, *cfile;
 
@@ -409,11 +406,10 @@ main(int argc, char **argv)
 	if(loadstations(stationfile) < 0)
 		fprint(2, "warning: could not load %s: %r\n", stationfile);
 
-	dragging = 0;
+	orbitinit(&orb, 0.0, 30.0, 1.0);
+	orb.zoommin = 0.5;
+	orb.zoommax = 128.0;
 	oldbuttons = 0;
-	dragclat = clat;
-	dragclon = clon;
-	dragstart = ZP;
 
 	redraw();
 
@@ -431,15 +427,13 @@ main(int argc, char **argv)
 			 * button edge detection below on the next event.
 			 */
 			if(m.buttons & 8){
-				zoom *= 1.15;
-				if(zoom > zoommax) zoom = zoommax;
+				orbitzoom(&orb, 1.15);
 				redraw();
 				oldbuttons = m.buttons;
 				break;
 			}
 			if(m.buttons & 16){
-				zoom /= 1.15;
-				if(zoom < zoommin) zoom = zoommin;
+				orbitzoom(&orb, 1.0/1.15);
 				redraw();
 				oldbuttons = m.buttons;
 				break;
@@ -447,63 +441,33 @@ main(int argc, char **argv)
 
 			/* left button: drag to rotate */
 			if(m.buttons & 1){
-				if(!dragging && !(oldbuttons & 1)){
-					dragging = 1;
-					dragstart = m.xy;
-					dragclat = clat;
-					dragclon = clon;
-					/* grabbing a spinning globe stops it dead */
-					vlat = 0.0;
-					vlon = 0.0;
-					lastclat = clat;
-					lastclon = clon;
-					lastmsec = m.msec;
-				}
-				if(dragging){
+				if(!orb.dragging && !(oldbuttons & 1)){
+					/* button-down edge: grab stops any spin */
+					orbitdown(&orb, m.xy.x, m.xy.y, m.msec);
+				} else {
 					/*
-					 * use the same geometry the renderer
-					 * uses (globerect(), which excludes the
-					 * status bar) so dragging tracks the
-					 * cursor exactly 1:1.
+					 * motion while held: compute the same
+					 * radius the renderer uses so drag
+					 * tracks the cursor exactly 1:1.
 					 */
-					globegeom(globerect(), zoom, &cx, &cy, &rad);
-
-					clon = dragclon - (double)(m.xy.x - dragstart.x) * 180.0 / rad;
-					clat = dragclat + (double)(m.xy.y - dragstart.y) * 180.0 / rad;
-					if(clat > 90.0) clat = 90.0;
-					if(clat < -90.0) clat = -90.0;
-					while(clon > 180.0) clon -= 360.0;
-					while(clon < -180.0) clon += 360.0;
-
-					/*
-					 * Track instantaneous velocity (deg/ms)
-					 * so we have a launch speed if the
-					 * button comes up on this frame.
-					 */
-					if(m.msec > lastmsec){
-						double dt = m.msec - lastmsec;
-						/*
-						 * clon has already been normalized
-						 * into [-180,180]; crossing the
-						 * antimeridian makes the raw delta
-						 * ~+-360, which would launch the
-						 * globe at absurd speed on release.
-						 * Wrap the delta first.
-						 */
-						double dlon = clon - lastclon;
-						while(dlon > 180.0) dlon -= 360.0;
-						while(dlon < -180.0) dlon += 360.0;
-						vlat = (clat - lastclat) / dt;
-						vlon = dlon / dt;
-						lastclat = clat;
-						lastclon = clon;
-						lastmsec = m.msec;
-					}
+					globegeom(globerect(), orb.zoom, &cx, &cy, &rad);
+					orbitmove(&orb, m.xy.x, m.xy.y, m.msec,
+						180.0 / rad);
 					redraw();
 				}
 			} else {
-				if(dragging){
-					dragging = 0;
+				if(orb.dragging){
+					/*
+					 * No button 1: end any drag, keeping
+					 * the launch velocity.  Deliberately
+					 * not an oldbuttons edge test -- the
+					 * scroll branches above break early
+					 * and overwrite oldbuttons, so a
+					 * release during a scroll chord would
+					 * lose the edge and leave the drag
+					 * stuck on.
+					 */
+					orbitup(&orb);
 				}
 			}
 
@@ -547,7 +511,7 @@ main(int argc, char **argv)
 			}
 
 			/* hover: find nearest station */
-			if(m.buttons == 0 && !dragging){
+			if(m.buttons == 0 && !orb.dragging){
 				int s = findstation(m.xy);
 				if(s != selstation){
 					selstation = s;
@@ -576,48 +540,45 @@ main(int argc, char **argv)
 				redraw();
 				break;
 			case Kleft:
-				clon -= 10.0 / zoom;
-				while(clon < -180.0) clon += 360.0;
+				orb.yaw -= 10.0 / orb.zoom;
+				orbitnorm(&orb);
 				redraw();
 				break;
 			case Kright:
-				clon += 10.0 / zoom;
-				while(clon > 180.0) clon -= 360.0;
+				orb.yaw += 10.0 / orb.zoom;
+				orbitnorm(&orb);
 				redraw();
 				break;
 			case Kup:
-				clat += 10.0 / zoom;
-				if(clat > 90.0) clat = 90.0;
+				orb.pitch += 10.0 / orb.zoom;
+				orbitnorm(&orb);
 				redraw();
 				break;
 			case Kdown:
-				clat -= 10.0 / zoom;
-				if(clat < -90.0) clat = -90.0;
+				orb.pitch -= 10.0 / orb.zoom;
+				orbitnorm(&orb);
 				redraw();
 				break;
 			case '+':
 			case '=':
-				zoom *= 1.3;
-				if(zoom > zoommax) zoom = zoommax;
+				orbitzoom(&orb, 1.3);
 				redraw();
 				break;
 			case '-':
-				zoom /= 1.3;
-				if(zoom < zoommin) zoom = zoommin;
+				orbitzoom(&orb, 1.0/1.3);
 				redraw();
 				break;
 			case '0':
-				zoom = 1.0;
-				clat = 30.0;
-				clon = 0.0;
+				orb.zoom = 1.0;
+				orb.pitch = 30.0;
+				orb.yaw = 0.0;
+				orbitnorm(&orb);
 				redraw();
 				break;
 			}
 			break;
 
 		case Etick:
-			if(dragging || (vlat == 0.0 && vlon == 0.0))
-				break;
 			/*
 			 * If a keystroke (e.g. quit) is already
 			 * waiting, skip this tick's redraw and let
@@ -635,17 +596,8 @@ main(int argc, char **argv)
 			 */
 			if(ecankbd())
 				break;
-			clon += vlon * Tickms;
-			clat += vlat * Tickms;
-			if(clat > 90.0) clat = 90.0;
-			if(clat < -90.0) clat = -90.0;
-			while(clon > 180.0) clon -= 360.0;
-			while(clon < -180.0) clon += 360.0;
-			vlat *= friction;
-			vlon *= friction;
-			if(fabs(vlat) < vmin && fabs(vlon) < vmin)
-				vlat = vlon = 0.0;
-			redraw();
+			if(orbittick(&orb, Tickms))
+				redraw();
 			break;
 		}
 	}

@@ -1,6 +1,7 @@
 #include <u.h>
 #include <libc.h>
 #include <draw.h>
+#include "view.h"
 #include "dat.h"
 
 /*
@@ -81,27 +82,6 @@ geo2vec(Geo g, Vec3 *v)
 	v->x = cl * cos(lon);
 	v->y = cl * sin(lon);
 	v->z = sin(lat);
-}
-
-/*
- * Compute the screen-space basis vectors for the current view
- * direction (clat, clon).  ex/ey are the screen-right/screen-up
- * unit vectors; ez points at the viewer.  Projecting a point is
- * then just three dot products -- no trig needed per point.
- */
-static void
-viewbasis(double clat, double clon, Vec3 *ex, Vec3 *ey, Vec3 *ez)
-{
-	double cla, sla, clo, slo;
-
-	cla = cos(clat * dtor);
-	sla = sin(clat * dtor);
-	clo = cos(clon * dtor);
-	slo = sin(clon * dtor);
-
-	ex->x = -slo;       ex->y = clo;        ex->z = 0;
-	ey->x = -sla*clo;   ey->y = -sla*slo;   ey->z = cla;
-	ez->x = cla*clo;    ez->y = cla*slo;    ez->z = sla;
 }
 
 static void
@@ -268,7 +248,7 @@ drawcoasts(Image *dst, Rectangle r, double clat, double clon, double zoom)
 	globegeom(r, zoom, &cx, &cy, &rad);
 
 	/* computed once per call, not once per point */
-	viewbasis(clat, clon, &ex, &ey, &ez);
+	viewbasis(clon, clat, &ex, &ey, &ez);
 
 	for(i = 0; i < ncoast; i++){
 		c = &coasts[i];
@@ -422,7 +402,7 @@ drawstations(Image *dst, Rectangle r, double clat, double clon, double zoom,
 	Vec3 ex, ey, ez;
 
 	globegeom(r, zoom, &cx, &cy, &rad);
-	viewbasis(clat, clon, &ex, &ey, &ez);
+	viewbasis(clon, clat, &ex, &ey, &ez);
 	dotr = dotradius(zoom);
 
 	for(i = 0; i < ns; i++){
@@ -462,7 +442,7 @@ stationhit(Rectangle r, double clat, double clon, double zoom, Point xy,
 	Vec3 ex, ey, ez;
 
 	globegeom(r, zoom, &cx, &cy, &rad);
-	viewbasis(clat, clon, &ex, &ey, &ez);
+	viewbasis(clon, clat, &ex, &ey, &ez);
 
 	maxd = 12 + dotradius(zoom);	/* max click distance, pixels */
 	best = -1;

@@ -2,6 +2,7 @@
 #include <libc.h>
 #include <draw.h>
 #include <bio.h>
+#include "view.h"
 #include "dat.h"
 
 /*

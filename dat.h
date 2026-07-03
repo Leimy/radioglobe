@@ -1,16 +1,9 @@
 typedef struct Station Station;
 typedef struct Geo Geo;
-typedef struct Vec3 Vec3;
 
 struct Geo {
 	double lat;	/* degrees, north positive */
 	double lon;	/* degrees, east positive */
-};
-
-/* unit vector on the sphere, precomputed from a Geo so per-frame
- * projection is a few multiplies/adds instead of sin/cos/asin/atan2 */
-struct Vec3 {
-	double x, y, z;
 };
 
 struct Station {

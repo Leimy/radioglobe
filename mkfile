@@ -7,6 +7,8 @@ TARG=\
 	mkcoast\
 	mkstations\
 
+LIBVIEW=/usr/dave/work/libview/libview.a$O
+
 GLOBEOFILES=\
 	main.$O\
 	globe.$O\
@@ -20,8 +22,11 @@ default:V: all
 
 all:V: $TARG
 
-radioglobe: $GLOBEOFILES
-	$LD -o $target $GLOBEOFILES
+$LIBVIEW:V:
+	@{cd /usr/dave/work/libview && mk}
+
+radioglobe: $GLOBEOFILES $LIBVIEW
+	$LD -o $target $GLOBEOFILES $LIBVIEW
 
 mkcoast: mkcoast.$O util.$O
 	$LD -o $target mkcoast.$O util.$O -ljson
@@ -30,7 +35,7 @@ mkstations: mkstations.$O util.$O
 	$LD -o $target mkstations.$O util.$O -ljson
 
 %.$O: %.c $HFILES
-	$CC $CFLAGS $stem.c
+	$CC $CFLAGS -I/usr/dave/work/libview $stem.c
 
 install:V: $TARG
 	for(i in $TARG) cp $i $BIN/$i
