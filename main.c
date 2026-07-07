@@ -55,6 +55,8 @@ int playing = -1;
 int streampid = -1;
 Image *statbg;
 static Image *back;	/* offscreen frame buffer; whole frame is composed here */
+static int dirty;	/* view/selection changed; render on next tick (see Etick) */
+static long frametime;	/* previous redraw's cost in ms; shown in the status bar */
 
 /*
  * Output sample rate for the audio device, in Hz.  The standard
@@ -149,7 +151,7 @@ globerect(void)
 static int
 findstation(Point xy)
 {
-	return stationhit(globerect(), orb.pitch, orb.yaw, orb.zoom, xy, stations, nstation);
+	return stationhit(globerect(), orb.pitch, orb.yaw, orb.zoom, xy, stations, nstation, selstation);
 }
 
 static char *
@@ -283,21 +285,19 @@ loadstations(char *path)
 }
 
 static void
-drawstatusbar(void)
+drawstatusbar(Image *dst)
 {
 	Rectangle r;
-	int h;
+	int h, w;
+	static int lastw;
 	char buf[256];
 	Point p;
+
 	h = font->height + 8;
 	r.min.x = screen->r.min.x;
 	r.max.x = screen->r.max.x;
 	r.max.y = screen->r.max.y;
 	r.min.y = r.max.y - h;
-
-	draw(back, r, statbg ? statbg : display->black, nil, ZP);
-
-	p = Pt(r.min.x + 6, r.min.y + 4);
 
 	if(playing >= 0 && playing < nstation){
 		if(selstation >= 0 && selstation != playing)
@@ -313,16 +313,41 @@ drawstatusbar(void)
 			stations[selstation].geo.lat,
 			stations[selstation].geo.lon);
 	else
-		snprint(buf, sizeof buf, "  [%.1f, %.1f]  zoom %.1fx",
-			orb.pitch, orb.yaw, orb.zoom);
+		snprint(buf, sizeof buf, "  [%.1f, %.1f]  zoom %.1fx  %ldms",
+			orb.pitch, orb.yaw, orb.zoom, frametime);
 
-	string(back, p, display->white, ZP, font, buf);
+	/*
+	 * On the light path (dst == screen) erase only as far as
+	 * the text reaches -- and as far as the previous text
+	 * reached -- instead of rewriting the full window-width
+	 * strip on every hover change; it's the biggest write that
+	 * path makes.  Full recomposes (dst == back) still paint
+	 * the whole strip, so back never accumulates stale tails.
+	 */
+	w = stringwidth(font, buf) + 12;
+	if(dst == screen){
+		if(w > lastw)
+			lastw = w;
+		if(r.min.x + lastw < r.max.x)
+			r.max.x = r.min.x + lastw;
+		lastw = w;
+	}else
+		lastw = w;
+
+	draw(dst, r, statbg ? statbg : display->black, nil, ZP);
+	p = Pt(r.min.x + 6, r.min.y + 4);
+	string(dst, p, display->white, ZP, font, buf);
 }
+
+static Rectangle selrect;	/* screen pixels covered by the selection overlay */
 
 static void
 redraw(void)
 {
 	Rectangle gr;
+	vlong t0;
+
+	t0 = nsec();
 
 	/*
 	 * Compose the whole frame offscreen, then blit it to the
@@ -341,9 +366,42 @@ redraw(void)
 
 	gr = globerect();
 	globedraw(back, gr, orb.pitch, orb.yaw, orb.zoom);
-	drawstations(back, gr, orb.pitch, orb.yaw, orb.zoom, stations, nstation, selstation);
-	drawstatusbar();
+	drawstations(back, gr, orb.pitch, orb.yaw, orb.zoom, stations, nstation);
+	drawstatusbar(back);
 	draw(screen, screen->r, back, nil, screen->r.min);
+	/*
+	 * The selection overlay goes to the screen only, after the
+	 * blit, so back always holds the selection-free base frame:
+	 * redrawsel() erases an old overlay by restoring its pixels
+	 * from back, which must not itself contain overlay pixels.
+	 */
+	selrect = drawsel(screen, gr, orb.pitch, orb.yaw, orb.zoom,
+		stations, nstation, selstation);
+	flushimage(display, 1);
+	frametime = (nsec() - t0) / 1000000;
+}
+
+/*
+ * Selection-only update: the view didn't change, so the base
+ * frame in back is still exact.  Erase the old overlay by
+ * restoring its pixels from back, draw the new overlay and the
+ * status bar, and leave every other pixel on screen untouched.
+ * Hovering across stations costs a couple of dot-sized writes
+ * instead of a full-window recompose that repainted every dot
+ * on screen to change one of them.
+ */
+static void
+redrawsel(void)
+{
+	if(back == nil){
+		redraw();
+		return;
+	}
+	if(Dx(selrect) > 0 && Dy(selrect) > 0)
+		draw(screen, selrect, back, nil, selrect.min);
+	selrect = drawsel(screen, globerect(), orb.pitch, orb.yaw, orb.zoom,
+		stations, nstation, selstation);
+	drawstatusbar(screen);
 	flushimage(display, 1);
 }
 
@@ -449,11 +507,22 @@ main(int argc, char **argv)
 					 * motion while held: compute the same
 					 * radius the renderer uses so drag
 					 * tracks the cursor exactly 1:1.
+					 *
+					 * Don't redraw here: at large dataset
+					 * scale a redraw outlasts the interval
+					 * between mouse events, so redrawing
+					 * per event backlogs the queue and
+					 * renders a parade of stale positions.
+					 * Just update the orbit (cheap; every
+					 * sample still feeds the velocity
+					 * tracker, so flick momentum is
+					 * unaffected) and let the next Etick
+					 * render the latest position once.
 					 */
 					globegeom(globerect(), orb.zoom, &cx, &cy, &rad);
 					orbitmove(&orb, m.xy.x, m.xy.y, m.msec,
 						180.0 / rad);
-					redraw();
+					dirty = 1;
 				}
 			} else {
 				if(orb.dragging){
@@ -468,6 +537,7 @@ main(int argc, char **argv)
 					 * stuck on.
 					 */
 					orbitup(&orb);
+					/* any pending final position renders on the next tick */
 				}
 			}
 
@@ -510,12 +580,28 @@ main(int argc, char **argv)
 				redraw();
 			}
 
-			/* hover: find nearest station */
+			/*
+			 * hover: find nearest station.  A selection
+			 * change doesn't touch the view, so it takes
+			 * the light path: restore + overlay + status
+			 * bar, a few tiny writes.  Cheap enough to do
+			 * per event, and no other pixel on screen is
+			 * written at all.
+			 */
 			if(m.buttons == 0 && !orb.dragging){
 				int s = findstation(m.xy);
 				if(s != selstation){
 					selstation = s;
-					redraw();
+					/*
+					 * If a view change is already pending
+					 * (momentum tick advanced the orbit
+					 * but its redraw hasn't run yet),
+					 * back and the screen lag the orbit
+					 * state; the queued full redraw will
+					 * include the new selection anyway.
+					 */
+					if(!dirty)
+						redrawsel();
 				}
 			}
 
@@ -597,7 +683,34 @@ main(int argc, char **argv)
 			if(ecankbd())
 				break;
 			if(orbittick(&orb, Tickms))
+				dirty = 1;
+			/*
+			 * Ticks pile up behind a slow redraw.  This
+			 * tick's physics is applied above, but if
+			 * another tick is already queued, let it do
+			 * the drawing: one redraw for the whole
+			 * backlog, with fully advanced state, instead
+			 * of a back-to-back burst of stale frames.
+			 */
+			if(ecanread(Etick))
+				break;
+			/*
+			 * All view-changing redraws -- drag motion and
+			 * momentum spin -- funnel through the dirty
+			 * flag: mouse events just mark the view stale,
+			 * and we render the latest state here, once per
+			 * tick.  Redraw rate is bounded at the tick
+			 * rate, the event queue can't back up behind
+			 * slow redraws, and every frame shows current
+			 * state instead of a queued stale one.
+			 * (Selection-only changes bypass this entirely
+			 * via redrawsel(), which is cheap enough to run
+			 * per event.)
+			 */
+			if(dirty){
+				dirty = 0;
 				redraw();
+			}
 			break;
 		}
 	}

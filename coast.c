@@ -213,6 +213,88 @@ computecap(Coastline *c)
 	c->capcos = mind;
 }
 
+enum {
+	Chunkpts = 256,	/* max points per polyline chunk; see chopcoasts */
+};
+
+/*
+ * Split long polylines into chunks of at most Chunkpts points.
+ * Adjacent chunks share their boundary point, so every segment
+ * is still drawn.
+ *
+ * The bounding-cap cull in drawcoasts() is only as good as the
+ * caps are tight: Natural Earth polylines can run for whole
+ * continents, and a cap that covers half the sphere never
+ * rejects anything, so the cull silently stopped working
+ * exactly on the detailed datasets that need it.  Short chunks
+ * get small caps, so the far side of the globe is actually
+ * skipped again.  Chunks alias the original pts arrays (the
+ * data lives for the life of the program; nothing frees it).
+ *
+ * Must run before computevecs(), which allocates vec[] and
+ * computes the cap and step per (post-chop) polyline.
+ */
+static void
+chopcoasts(void)
+{
+	Coastline *new, *c;
+	int i, n, start, len;
+
+	n = 0;
+	for(i = 0; i < ncoast; i++){
+		if(coasts[i].npts <= Chunkpts)
+			n++;
+		else
+			n += (coasts[i].npts - 1 + Chunkpts - 2) / (Chunkpts - 1);
+	}
+	new = malloc(n * sizeof(Coastline));
+	if(new == nil)
+		sysfatal("malloc: %r");
+	n = 0;
+	for(i = 0; i < ncoast; i++){
+		c = &coasts[i];
+		for(start = 0; ; start += Chunkpts - 1){
+			len = c->npts - start;
+			if(len > Chunkpts)
+				len = Chunkpts;
+			new[n].pts = c->pts + start;
+			new[n].npts = len;
+			n++;
+			if(start + len >= c->npts)
+				break;
+		}
+	}
+	free(coasts);
+	coasts = new;
+	ncoast = n;
+}
+
+/*
+ * Mean angular step between consecutive points, in radians.
+ * Feeds the LOD stride in drawcoasts(); see dat.h.
+ */
+static double
+meanstep(Coastline *c)
+{
+	int j;
+	double sum, d;
+
+	if(c->npts < 2)
+		return 0;
+	sum = 0;
+	for(j = 1; j < c->npts; j++){
+		d = c->vec[j-1].x*c->vec[j].x
+		  + c->vec[j-1].y*c->vec[j].y
+		  + c->vec[j-1].z*c->vec[j].z;
+		if(d > 1)
+			d = 1;
+		if(d < -1)
+			d = -1;
+		sum += acos(d);
+	}
+	return sum / (c->npts - 1);
+}
+
 /*
  * Precompute a unit vector for every point of every coastline, plus
  * a bounding cap per coastline (see computecap above).  This is the
@@ -240,6 +322,7 @@ computevecs(void)
 		for(j = 0; j < c->npts; j++)
 			geo2vec(c->pts[j], &c->vec[j]);
 		computecap(c);
+		c->step = meanstep(c);
 	}
 }
 
@@ -266,5 +349,6 @@ coastinit(void)
 		fprint(2, "radioglobe: no coast.dat found, using coarse outline\n");
 		usefallback();
 	}
+	chopcoasts();
 	computevecs();
 }

@@ -19,8 +19,9 @@ void	globegeom(Rectangle r, double zoom, int *cx, int *cy, int *rad);
 void	globedraw(Image *dst, Rectangle r, double clat, double clon, double zoom);
 void	geo2screen(Rectangle r, double clat, double clon, double zoom, Geo g, Point *p, int *visible);
 void	geo2vec(Geo g, Vec3 *v);
-void	drawstations(Image *dst, Rectangle r, double clat, double clon, double zoom, Station *s, int ns, int sel);
-int	stationhit(Rectangle r, double clat, double clon, double zoom, Point xy, Station *s, int ns);
+void	drawstations(Image *dst, Rectangle r, double clat, double clon, double zoom, Station *s, int ns);
+Rectangle	drawsel(Image *dst, Rectangle r, double clat, double clon, double zoom, Station *s, int ns, int sel);
+int	stationhit(Rectangle r, double clat, double clon, double zoom, Point xy, Station *s, int ns, int cursel);
 
 /* coast.c - coastline polygon data */
 typedef struct Coastline Coastline;
@@ -45,6 +46,15 @@ struct Coastline {
 	 */
 	Vec3 center;
 	double capcos;
+
+	/*
+	 * Mean angular spacing of consecutive points, in radians
+	 * (0 if unknown/degenerate).  Set once at load; drawcoasts()
+	 * multiplies by the projected radius to get on-screen pixel
+	 * spacing and picks an LOD stride so it never walks points
+	 * that are sub-pixel at the current zoom.
+	 */
+	double step;
 };
 
 extern Coastline *coasts;

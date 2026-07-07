@@ -84,13 +84,16 @@ geo2vec(Geo g, Vec3 *v)
 	v->z = sin(lat);
 }
 
+/*
+ * Project p against the view basis.  *cosc is the dot product
+ * with ez: positive means facing the viewer (visible), and its
+ * magnitude says how far from the limb (0 = exactly on the
+ * horizon), which drawstations uses to taper dot size.
+ */
 static void
-vecproject(Vec3 *ex, Vec3 *ey, Vec3 *ez, Vec3 p, double *px, double *py, int *vis)
+vecproject(Vec3 *ex, Vec3 *ey, Vec3 *ez, Vec3 p, double *px, double *py, double *cosc)
 {
-	double cosc;
-
-	cosc = p.x*ez->x + p.y*ez->y + p.z*ez->z;
-	*vis = cosc > 0.0;
+	*cosc = p.x*ez->x + p.y*ez->y + p.z*ez->z;
 	*px = p.x*ex->x + p.y*ex->y + p.z*ex->z;
 	*py = p.x*ey->x + p.y*ey->y + p.z*ey->z;
 }
@@ -240,8 +243,8 @@ static void
 drawcoasts(Image *dst, Rectangle r, double clat, double clon, double zoom)
 {
 	static Point runbuf[Maxpolypts];
-	int i, j, vis, cx, cy, rad, nrun;
-	double x, y;
+	int i, j, cx, cy, rad, nrun, px, py, stride;
+	double x, y, cosc;
 	Vec3 ex, ey, ez;
 	Coastline *c;
 
@@ -281,17 +284,53 @@ drawcoasts(Image *dst, Rectangle r, double clat, double clon, double zoom)
 		 * call); now it costs one call per visible run, or a
 		 * handful if a run is longer than Maxpolypts.
 		 */
+		/*
+		 * LOD stride: c->step * rad is the average on-screen
+		 * spacing of consecutive points in pixels.  When it
+		 * falls below a pixel, walking every point buys no
+		 * visible detail -- it only costs projection math and
+		 * raster work -- so step over points to bring the
+		 * drawn spacing back up to about a pixel.  Zoom in
+		 * and the stride falls back to 1 (full detail).
+		 */
+		stride = 1;
+		if(c->step > 0 && c->step * rad < 1.0)
+			stride = (int)(1.0 / (c->step * rad));
+		if(stride > 16)
+			stride = 16;
+
 		nrun = 0;
-		for(j = 0; j < c->npts; j++){
-			vecproject(&ex, &ey, &ez, c->vec[j], &x, &y, &vis);
-			if(!vis){
+		for(j = 0; j < c->npts; j += stride){
+			/*
+			 * Never skip the final point: adjacent chunks
+			 * share it, and dropping it opens gaps at the
+			 * chunk boundaries.  Shortening the stride for
+			 * the last hop is fine; only this polyline's
+			 * final iteration uses it.
+			 */
+			if(j + stride >= c->npts && j < c->npts - 1)
+				stride = c->npts - 1 - j;
+			vecproject(&ex, &ey, &ez, c->vec[j], &x, &y, &cosc);
+			if(cosc <= 0.0){
 				if(nrun > 1)
 					poly(dst, runbuf, nrun, Endsquare, Endsquare, 0, coastcol, ZP);
 				nrun = 0;
 				continue;
 			}
-			runbuf[nrun].x = cx + (int)(x * rad);
-			runbuf[nrun].y = cy - (int)(y * rad);
+			px = cx + (int)(x * rad);
+			py = cy - (int)(y * rad);
+			/*
+			 * Skip consecutive points that project to the
+			 * same pixel.  Zoomed out, most of a detailed
+			 * dataset collapses onto repeated pixels, and
+			 * every point kept here costs a memline in the
+			 * draw device.  The drawn segments are
+			 * identical minus the zero-length ones.
+			 */
+			if(nrun > 0 && runbuf[nrun-1].x == px && runbuf[nrun-1].y == py)
+				continue;
+			runbuf[nrun].x = px;
+			runbuf[nrun].y = py;
 			nrun++;
 			if(nrun == Maxpolypts){
 				poly(dst, runbuf, nrun, Endsquare, Endsquare, 0, coastcol, ZP);
@@ -381,6 +420,66 @@ dotradius(double zoom)
 }
 
 /*
+ * Dot radius tapered near the limb: full size away from the
+ * horizon, shrinking to 1px right at it.  Without the taper a
+ * dot pops in and out at full size as rotation carries it
+ * across the visibility threshold; growing it through a narrow
+ * band (cosc in [0, band]) turns the pop into a swell.
+ */
+static int
+dotsize(int dotr, double cosc)
+{
+	double band;
+
+	band = 0.08;
+	if(cosc >= band)
+		return dotr;
+	return 1 + (int)((dotr-1) * cosc / band);
+}
+
+enum {
+	Dothash		= 8192,	/* per-frame dot dedup table; power of two */
+	Maxprobe	= 8,
+};
+
+static ulong dotpos[Dothash];
+static uint dotstamp[Dothash];
+static uint dotgen;
+
+/*
+ * Per-frame dot dedup: true if a dot was already drawn at (x,y)
+ * this frame, recording it if not.  Stations stack -- many
+ * entries share one coordinate, and zoomed out whole clusters
+ * collapse onto single pixels -- and every duplicate costs a
+ * fillellipse message to the draw device to repaint pixels that
+ * are already painted.  Generation stamps make per-frame
+ * clearing free; the short probe cap means a crowded table just
+ * lets the odd duplicate through (a few wasted pixels) rather
+ * than scanning.  drawstations bumps dotgen once per frame.
+ */
+static int
+dotseen(int x, int y)
+{
+	ulong key;
+	uint h;
+	int i;
+
+	key = (ulong)(x & 0xffff)<<16 | (y & 0xffff);
+	h = (key * 2654435761U) & (Dothash-1);
+	for(i = 0; i < Maxprobe; i++){
+		if(dotstamp[h] != dotgen){
+			dotstamp[h] = dotgen;
+			dotpos[h] = key;
+			return 0;
+		}
+		if(dotpos[h] == key)
+			return 1;
+		h = (h+1) & (Dothash-1);
+	}
+	return 0;
+}
+
+/*
  * Draw the station dots.  Like drawcoasts(), this projects each
  * station's precomputed unit vector (Station.vec, set once at load
  * time in main.c:loadstations() via geo2vec()) against a per-frame
@@ -393,35 +492,94 @@ dotradius(double zoom)
  */
 void
 drawstations(Image *dst, Rectangle r, double clat, double clon, double zoom,
-	Station *s, int ns, int sel)
+	Station *s, int ns)
 {
-	int i, vis, dotr, cx, cy, rad;
-	double x, y;
+	int i, dotr, dr, cx, cy, rad;
+	double x, y, cosc;
 	Point p;
-	Image *col;
+	Rectangle clipr;
 	Vec3 ex, ey, ez;
 
 	globegeom(r, zoom, &cx, &cy, &rad);
 	viewbasis(clon, clat, &ex, &ey, &ez);
 	dotr = dotradius(zoom);
+	clipr = insetrect(r, -dotr);	/* centers outside this can't touch r */
+	dotgen++;			/* new dedup frame; see dotseen */
 
 	for(i = 0; i < ns; i++){
-		vecproject(&ex, &ey, &ez, s[i].vec, &x, &y, &vis);
-		if(!vis)
+		vecproject(&ex, &ey, &ez, s[i].vec, &x, &y, &cosc);
+		if(cosc <= 0.0)
 			continue;
 		p.x = cx + (int)(x * rad);
 		p.y = cy - (int)(y * rad);
-		col = (i == sel) ? dotsel : dotcol;
-		fillellipse(dst, p, dotr, dotr, col, ZP);
-
-		/* draw label for selected station */
-		if(i == sel){
-			Point tp;
-			tp.x = p.x + dotr + 4;
-			tp.y = p.y - font->height/2;
-			string(dst, tp, textcol, ZP, font, s[i].name);
-		}
+		/* zoomed in, most of the hemisphere projects off-window */
+		if(!ptinrect(p, clipr))
+			continue;
+		/*
+		 * Cluster-lite: dedup by dotr-sized cell rather than
+		 * exact pixel, so stations packed closer together
+		 * than a dot radius draw as one dot instead of a
+		 * smeared stack.  Such dots already overlapped almost
+		 * entirely; this also cuts the message count in the
+		 * dense areas where it matters.
+		 */
+		if(dotseen(p.x/dotr, p.y/dotr))
+			continue;
+		dr = dotsize(dotr, cosc);
+		fillellipse(dst, p, dr, dr, dotcol, ZP);
 	}
+}
+
+/*
+ * Draw the selection overlay -- the selected station's dot in
+ * the highlight color plus its name label -- and return the
+ * rectangle it covered (ZR if nothing was drawn).  All stations,
+ * the selected one included, are drawn plain by drawstations;
+ * the overlay is painted over the top.
+ *
+ * Kept separate from drawstations so main.c can update just
+ * this overlay when only the selection changes: hovering across
+ * stations then costs two small screen writes (restore the old
+ * overlay's pixels from the composed base, draw the new one)
+ * instead of a full-window recompose, which repainted every dot
+ * on screen -- and visibly disturbed all of them on displays
+ * with unsynchronized presentation -- to change one.
+ */
+Rectangle
+drawsel(Image *dst, Rectangle r, double clat, double clon, double zoom,
+	Station *s, int ns, int sel)
+{
+	int dotr, dr, cx, cy, rad;
+	double x, y, cosc;
+	Point p, tp;
+	Rectangle or;
+	Vec3 ex, ey, ez;
+
+	if(sel < 0 || sel >= ns)
+		return ZR;
+	globegeom(r, zoom, &cx, &cy, &rad);
+	viewbasis(clon, clat, &ex, &ey, &ez);
+	vecproject(&ex, &ey, &ez, s[sel].vec, &x, &y, &cosc);
+	if(cosc <= 0.0)
+		return ZR;
+	dotr = dotradius(zoom);
+	p.x = cx + (int)(x * rad);
+	p.y = cy - (int)(y * rad);
+	if(!ptinrect(p, insetrect(r, -dotr)))
+		return ZR;
+
+	dr = dotsize(dotr, cosc);
+	fillellipse(dst, p, dr, dr, dotsel, ZP);
+	tp.x = p.x + dr + 4;
+	tp.y = p.y - font->height/2;
+	string(dst, tp, textcol, ZP, font, s[sel].name);
+
+	or = Rect(p.x-dr-1, p.y-dr-1, p.x+dr+2, p.y+dr+2);
+	combinerect(&or, Rect(tp.x, tp.y,
+		tp.x + stringwidth(font, s[sel].name), tp.y + font->height));
+	if(!rectclip(&or, dst->r))
+		return ZR;
+	return or;
 }
 
 /*
@@ -435,22 +593,44 @@ drawstations(Image *dst, Rectangle r, double clat, double clon, double zoom,
  */
 int
 stationhit(Rectangle r, double clat, double clon, double zoom, Point xy,
-	Station *s, int ns)
+	Station *s, int ns, int cursel)
 {
-	int i, vis, cx, cy, rad, px, py, best, bestd, maxd, d;
-	double x, y;
+	int i, cx, cy, rad, px, py, best, bestd, maxd, d;
+	double x, y, cosc;
 	Vec3 ex, ey, ez;
 
 	globegeom(r, zoom, &cx, &cy, &rad);
 	viewbasis(clon, clat, &ex, &ey, &ez);
 
 	maxd = 12 + dotradius(zoom);	/* max click distance, pixels */
+
+	/*
+	 * Sticky selection: while the cursor is still on the
+	 * current selection, keep it, even if a neighbor is now
+	 * nearer.  In a dense station file the nearest station
+	 * changes on nearly every pixel of mouse travel, so
+	 * without stickiness the hover label hops between packed
+	 * neighbors; with it, the selection only moves once the
+	 * cursor actually leaves the selected station.  It also
+	 * means a click always hits the station the label names.
+	 */
+	if(cursel >= 0 && cursel < ns){
+		vecproject(&ex, &ey, &ez, s[cursel].vec, &x, &y, &cosc);
+		if(cosc > 0.0){
+			px = cx + (int)(x * rad);
+			py = cy - (int)(y * rad);
+			d = (px - xy.x)*(px - xy.x) + (py - xy.y)*(py - xy.y);
+			if(d <= maxd*maxd)
+				return cursel;
+		}
+	}
+
 	best = -1;
 	bestd = maxd*maxd;
 
 	for(i = 0; i < ns; i++){
-		vecproject(&ex, &ey, &ez, s[i].vec, &x, &y, &vis);
-		if(!vis)
+		vecproject(&ex, &ey, &ez, s[i].vec, &x, &y, &cosc);
+		if(cosc <= 0.0)
 			continue;
 		px = cx + (int)(x * rad);
 		py = cy - (int)(y * rad);

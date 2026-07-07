@@ -597,6 +597,211 @@ fail -- mk stats object files before clean deletes them, decides
 they're up to date, then the link step can't find them.  Run
 `mk clean` and `mk` as separate invocations.
 
+## Drag smoothness round (landed)
+
+Investigating "flickers a lot with detailed maps and lots of
+stations".  First finding: the frame IS already fully composed
+offscreen -- redraw() renders globe+stations+statusbar into a
+`back` image and blits it to screen with one draw() + one
+flushimage().  There is no flip primitive in the draw device;
+a single atomic blit is the best available, and we do it.  If
+literal flicker (half-drawn frames) is still observed, check
+that /$objtype/bin/radioglobe isn't a stale pre-back-buffer
+binary: `mk install`.
+
+Two new fixes for the stutter that remains at coast2/stations2
+scale:
+
+1. **Frame-paced drag redraws (main.c).**  The drag handler
+   redrew on every mouse-motion event.  When one redraw takes
+   longer than the gap between mouse events, the event queue
+   backlogs and every stale intermediate position gets fully
+   rendered in sequence -- the globe visibly lags and judders
+   behind the cursor.  Now drag motion only updates the orbit
+   (cheap; every sample still feeds the velocity tracker, so
+   flick momentum is unchanged) and sets a `dragdirty` flag;
+   the existing 40Hz Etick renders the latest state once per
+   tick while dragging.  Release renders any pending final
+   position immediately.  Redraw rate is now bounded at 40Hz
+   no matter how fast the mouse streams events.
+
+2. **Same-pixel point suppression (globe.c:drawcoasts()).**
+   Zoomed out, consecutive coastline points overwhelmingly
+   project to the same pixel; each kept point costs a memline
+   in the draw device.  Points identical to the previous
+   runbuf entry are now skipped -- the drawn segments are
+   identical minus zero-length ones.  Cuts raster + protocol
+   cost roughly in proportion to (dataset density / zoom); does
+   NOT cut per-point projection cost (see LOD below).
+
+### Follow-up: dot flicker at stations2 scale (landed)
+
+Dots still flickered with stations2 (fine with the small
+stations file).  Two causes, both scaling with station density:
+
+1. **Selected dot + label drawn mid-loop, then overdrawn
+   (globe.c:drawstations()).**  The orange dot and its label
+   were emitted the moment the loop hit i==sel; every
+   later-indexed station then drew on top of them.  Dense file
+   = real overlaps, and *which* dots overlapped changed every
+   frame during rotation, so the selection and label visibly
+   flickered.  Now the loop skips sel and draws the selected
+   dot + label after all other dots, always on top.
+
+2. **Hover selection churn = unpaced redraw storm (main.c).**
+   findstation() runs per mouse-motion event; in a dense field
+   the nearest station changes on nearly every pixel of travel,
+   and each change triggered an immediate full redraw -- same
+   backlog disease the drag path had, each queued redraw
+   showing a different selection.  Hover changes now just set
+   the dirty flag.
+
+While there, unified the pacing: the per-drag dragdirty flag
+became a general `dirty` flag; drag motion, momentum ticks, and
+hover changes all mark it, and Etick renders the latest state
+at most once per tick.  This also deleted the special-case
+render-on-release and render-while-dragging blocks from the
+previous round -- one funnel instead of three paths.  Discrete
+actions (zoom, keyboard, menu, click) still redraw immediately.
+
+### Follow-up 2: limb popping, dot dedup, sticky hover (landed)
+
+Third round on "dots flicker at stations2 scale", attacking the
+remaining mechanisms (globe.c, one prototype in dat.h/main.c):
+
+1. **Limb taper (dotsize()).**  Dots popped in and out at full
+   size as rotation carried them across the cosc>0 visibility
+   threshold.  vecproject() now reports cosc itself (magnitude =
+   distance from the limb) instead of a boolean, and dot radius
+   ramps from 1px at the horizon to full size over a narrow band
+   (cosc 0..0.08) -- the pop becomes a swell.
+2. **Per-frame dot dedup (dotseen()).**  Stations stack (many
+   share one coordinate; zoomed out, whole clusters collapse
+   onto single pixels), and every duplicate cost a fillellipse
+   message repainting already-painted pixels.  A generation-
+   stamped open-addressed table (free per-frame clear, short
+   probe cap that fails open to just drawing a duplicate) drops
+   dots already drawn at the same pixel this frame.
+3. **Off-window cull.**  Zoomed in, most of the visible
+   hemisphere projects outside the window; those dots were still
+   sent to the draw device to be clipped there.  ptinrect against
+   the window (inset by -dotr) skips them client-side.
+4. **Sticky hover selection (stationhit()).**  In a dense field
+   the nearest station changes on nearly every pixel of travel,
+   so the label hopped between packed neighbors even at paced
+   redraw rates.  stationhit() now takes the current selection
+   and keeps it while the cursor remains within hit distance of
+   it; selection changes only when the cursor actually leaves
+   the selected station.  Also means a click always hits the
+   station the label names.
+
+### Follow-up 3: frame cost + pacing round (landed)
+
+Remaining flicker at stations2/coast2 scale is dominated by low
+frame rate (moving dots strobe when they jump many pixels per
+frame) plus unsynchronized presentation (no vsync anywhere in
+the stack; the only mitigation is being fast).  So this round
+attacks frame cost and pacing, and adds measurement:
+
+1. **Coastline chunking (coast.c:chopcoasts()).**  The long-
+   deferred, confirmed-needed fix: polylines are split into
+   <=256-point chunks at load (adjacent chunks share the
+   boundary point; chunks alias the original pts arrays).
+   Continent-length polylines had caps covering half the
+   sphere, so the bounding-cap cull never fired on exactly the
+   datasets that needed it; tight per-chunk caps make it work
+   again.
+2. **Zoom LOD (dat.h, coast.c:meanstep(), globe.c).**  Each
+   (post-chop) polyline records its mean angular point spacing
+   at load.  drawcoasts() converts that to on-screen pixels
+   (step*rad) and strides over points when consecutive points
+   are sub-pixel, clamped to 16x, always landing on the final
+   point so chunk boundaries stay connected.  Zoomed out, work
+   scales with pixels on screen instead of dataset size; zoomed
+   in, stride returns to 1 (full detail).
+3. **Tick coalescing (main.c).**  Ticks that pile up behind a
+   slow redraw each triggered another redraw back-to-back
+   (bursty, always slightly stale).  The Etick handler now
+   applies each tick's physics but skips the redraw when
+   ecanread(Etick) shows another tick already queued -- one
+   redraw for the whole backlog, with fully advanced state.
+4. **Frame-time readout (main.c).**  redraw() times itself and
+   the idle status line shows the previous frame's cost in ms.
+   Diagnosis without guessing: if the number is high, flicker
+   is strobing/low fps (attack frame cost); if it's low and
+   flicker persists during motion only, it's presentation-level
+   tearing (nothing app-side left); if flicker shows on a fully
+   idle globe, it isn't radioglobe at all (stale binary or
+   display path).
+
+### Follow-up 4: selection-only updates (landed)
+
+User observation that nailed the remaining hover flicker: merely
+mousing over any station repainted dots nowhere near the pointer.
+A hover selection change was taking the full redraw path -- whole
+cache blit, every dot, full-window blit to screen -- to change
+what amounts to one dot's color, a label, and the status bar.  On
+a display path with unsynchronized presentation, that full-window
+rewrite is visible as a global dot shimmer.
+
+Now split into base + overlay (globe.c, main.c, dat.h):
+
+- drawstations() draws ALL dots plain (including the selected
+  one) into the composed base frame in `back`.
+- drawsel() (new) draws the highlight dot + label over the top
+  and returns the screen rectangle it covered.
+- redraw() keeps the overlay OUT of back: it composes base into
+  back, blits, then draws the overlay on the screen only.  back
+  therefore always holds the selection-free base.
+- redrawsel() (new light path, used by the hover handler): when
+  only the selection changed, restore the old overlay rect's
+  pixels from back, draw the new overlay, redraw the status bar.
+  Every other pixel on screen is not written at all -- distant
+  dots physically cannot flicker on hover now.
+
+Selection changes are cheap enough to run per mouse event again,
+so they bypass the tick pacing (which still governs all
+view-changing redraws).
+
+### Follow-up 5: light-path polish (landed)
+
+Why mouseover flicker happened at all, for the record: nothing
+in the display stack has vsync (app blit, framebuffer, host
+presentation all free-run), so a full-window rewrite -- which is
+what a hover selection change used to trigger -- can always be
+sampled mid-write.  Small high-contrast dots show that most.
+The base+overlay split (follow-up 4) fixed the structure; this
+round trims what remains:
+
+- **Status bar strip trimmed on the light path (main.c).**  The
+  full window-width bar erase+text was the biggest write left on
+  a hover change.  dst==screen now erases only as far as the new
+  text (and the previous text) reaches; full recomposes into
+  back still paint the whole strip so no stale tails survive.
+- **Hover skips the light path while a view redraw is pending
+  (main.c).**  If a momentum tick advanced the orbit but its
+  redraw hasn't run, back/screen lag the orbit; drawing an
+  overlay positioned by the new orbit onto the old frame briefly
+  misplaces it.  When dirty is set, the queued full redraw shows
+  the new selection instead.
+- **Cluster-lite dots (globe.c).**  The per-frame dedup now
+  keys on dotr-sized cells instead of exact pixels: stations
+  packed closer than a dot radius (which already overlapped
+  almost entirely) draw as one dot.  Cleaner look in dense
+  areas and fewer fillellipse messages exactly where there were
+  most.
+
+Diagnostic for "is my binary current": wave the mouse over dots
+without dragging and watch the ms number in the status bar.  The
+light path doesn't recompute it, so if it updates on mere hover,
+the running binary predates follow-up 4 -- mk install.
+
+Still open:
+
+- **Real station clustering** (cluster-lite above merges
+  same-cell dots at draw time; a fuller version would merge
+  near-neighbors, show cluster counts, and cut hit-test cost).
+
 ## TODO / ideas
 
 - mixfs for playback (auto-resample + multiple simultaneous
