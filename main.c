@@ -466,7 +466,15 @@ main(int argc, char **argv)
 
 	orbitinit(&orb, 0.0, 30.0, 1.0);
 	orb.zoommin = 0.5;
-	orb.zoommax = 128.0;
+	/*
+	 * 512x resolves same-city station clusters that 128x left
+	 * merged: at 128x on a ~1000px window a degree is ~1100px,
+	 * so stations a few hundred meters apart still landed
+	 * within one dot.  Safe now that stationhit() box-rejects
+	 * before squaring pixel distances (at these radii the
+	 * squares overflowed int).
+	 */
+	orb.zoommax = 512.0;
 	oldbuttons = 0;
 
 	redraw();

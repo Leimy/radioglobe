@@ -408,10 +408,21 @@ globedraw(Image *dst, Rectangle r, double clat, double clon, double zoom)
 	draw(dst, r, cache, nil, r.min);
 }
 
-/* station dot radius in pixels, grows a little with zoom */
+/*
+ * Station dot radius in pixels: grows a little with zoom, then
+ * shrinks again at deep zoom.  The per-frame dedup merges any
+ * stations packed closer than a dot radius into one drawn dot,
+ * so big dots keep dense clusters (e.g. European cities) fused
+ * into a single blob well past the zoom level where smaller
+ * dots would already resolve them into individually hoverable
+ * targets.  At 24x and beyond, screen separation is what's
+ * scarce, not dot visibility, so trade size for resolution.
+ */
 static int
 dotradius(double zoom)
 {
+	if(zoom > 24.0)
+		return 3;
 	if(zoom > 3.0)
 		return 5;
 	if(zoom > 1.5)
@@ -595,32 +606,44 @@ int
 stationhit(Rectangle r, double clat, double clon, double zoom, Point xy,
 	Station *s, int ns, int cursel)
 {
-	int i, cx, cy, rad, px, py, best, bestd, maxd, d;
+	int i, cx, cy, rad, px, py, best, bestd, maxd, dotr, dx, dy, dr, d;
 	double x, y, cosc;
 	Vec3 ex, ey, ez;
 
 	globegeom(r, zoom, &cx, &cy, &rad);
 	viewbasis(clon, clat, &ex, &ey, &ez);
 
-	maxd = 12 + dotradius(zoom);	/* max click distance, pixels */
+	dotr = dotradius(zoom);
+	maxd = 12 + dotr;	/* max click distance, pixels */
 
 	/*
 	 * Sticky selection: while the cursor is still on the
-	 * current selection, keep it, even if a neighbor is now
-	 * nearer.  In a dense station file the nearest station
-	 * changes on nearly every pixel of mouse travel, so
-	 * without stickiness the hover label hops between packed
+	 * current selection's drawn dot (plus a couple px of
+	 * slack), keep it, even if a neighbor is now nearer.  In
+	 * a dense station file the nearest station changes on
+	 * nearly every pixel of mouse travel, so without
+	 * stickiness the hover label hops between packed
 	 * neighbors; with it, the selection only moves once the
-	 * cursor actually leaves the selected station.  It also
-	 * means a click always hits the station the label names.
+	 * cursor actually leaves the selected dot.  It also means
+	 * a click always hits the station the label names.
+	 *
+	 * The sticky zone used to be the full grab radius (maxd,
+	 * ~17px), which made dense clusters nearly unselectable:
+	 * every neighbor sat inside the current selection's sticky
+	 * zone, so hover could never move to them without leaving
+	 * the whole neighborhood.  The dot itself is the right
+	 * boundary -- slide off it and nearest-wins resumes.
 	 */
 	if(cursel >= 0 && cursel < ns){
 		vecproject(&ex, &ey, &ez, s[cursel].vec, &x, &y, &cosc);
 		if(cosc > 0.0){
 			px = cx + (int)(x * rad);
 			py = cy - (int)(y * rad);
-			d = (px - xy.x)*(px - xy.x) + (py - xy.y)*(py - xy.y);
-			if(d <= maxd*maxd)
+			dx = px - xy.x;
+			dy = py - xy.y;
+			dr = dotsize(dotr, cosc) + 2;
+			if(dx >= -dr && dx <= dr && dy >= -dr && dy <= dr &&
+			   dx*dx + dy*dy <= dr*dr)
 				return cursel;
 		}
 	}
@@ -634,7 +657,20 @@ stationhit(Rectangle r, double clat, double clon, double zoom, Point xy,
 			continue;
 		px = cx + (int)(x * rad);
 		py = cy - (int)(y * rad);
-		d = (px - xy.x)*(px - xy.x) + (py - xy.y)*(py - xy.y);
+		dx = px - xy.x;
+		dy = py - xy.y;
+		/*
+		 * Box-reject before squaring.  Zoomed in, rad is
+		 * tens of thousands of pixels and a visible-but-
+		 * far-off-window station projects up to ~2*rad from
+		 * the cursor; squaring that overflows a 32-bit int,
+		 * and the wrapped "distance" could beat the station
+		 * actually under the cursor.  Everything inside the
+		 * box squares safely.
+		 */
+		if(dx > maxd || dx < -maxd || dy > maxd || dy < -maxd)
+			continue;
+		d = dx*dx + dy*dy;
 		if(d < bestd){
 			bestd = d;
 			best = i;

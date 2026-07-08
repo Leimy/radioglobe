@@ -796,6 +796,45 @@ without dragging and watch the ms number in the status bar.  The
 light path doesn't recompute it, so if it updates on mere hover,
 the running binary predates follow-up 4 -- mk install.
 
+### Follow-up 6: dense-cluster selection round (landed)
+
+User report: individual stations in dense clusters (Europe) are
+nearly impossible to hover-select at almost any zoom level.
+Four causes/fixes (globe.c, main.c):
+
+1. **Int overflow in stationhit() (real bug).**  Squared pixel
+   distances were computed in int; zoomed in, rad reaches tens
+   of thousands of pixels, a far-off-window station projects up
+   to ~2*rad from the cursor, and (2*rad)^2 overflows 32 bits
+   (from roughly zoom 45 on a ~1000px window).  Wrapped
+   "distances" could beat the station actually under the cursor,
+   making selection erratic exactly when zooming in to split a
+   cluster.  Fixed with a box-reject against maxd before
+   squaring (also cheaper); the sticky-check square is guarded
+   the same way.
+2. **Sticky zone shrunk to the drawn dot.**  Sticky selection
+   kept the current station while the cursor stayed within the
+   full grab radius (maxd ~17px).  In a dense cluster every
+   neighbor sits inside that zone, so hover could never move to
+   them without leaving the whole neighborhood.  The sticky
+   boundary is now the drawn dot itself (dotsize()+2px); slide
+   off the dot and nearest-wins resumes.  Clicks still hit the
+   station the label names.
+3. **Dots shrink again at deep zoom (dotradius()).**  Dots were
+   5px for all zoom > 3, and cluster-lite dedup merges anything
+   packed closer than a dot radius, so clusters stayed fused as
+   one blob well past the zoom where 3px dots would resolve
+   them.  At zoom > 24 dots drop back to 3px: separation is
+   what's scarce there, not visibility.
+4. **zoommax raised 128 -> 512 (main.c).**  At 128x on a ~1000px
+   window a degree is ~1100px, so same-city stations a few
+   hundred meters apart still landed within one dot.  512x gives
+   4x the separation.  Safe now that the hit test box-rejects
+   before squaring (fix 1); draw-side coordinates stay well
+   within int range.  Stations at *identical* coordinates still
+   can never be separated by zoom -- that's the standing de-dup
+   TODO.
+
 Still open:
 
 - **Real station clustering** (cluster-lite above merges
