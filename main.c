@@ -56,6 +56,7 @@ int streampid = -1;
 Image *statbg;
 static Image *back;	/* offscreen frame buffer; whole frame is composed here */
 static int dirty;	/* view/selection changed; render on next tick (see Etick) */
+static int needfine;	/* last render was coarse; render a full-quality settle frame when motion stops */
 static long frametime;	/* previous redraw's cost in ms; shown in the status bar */
 
 /*
@@ -416,7 +417,7 @@ eresized(int new)
 static void
 usage(void)
 {
-	fprint(2, "usage: %s [-s stationfile] [-c coastfile] [-r devrate]\n", argv0);
+	fprint(2, "usage: %s [-s stationfile] [-c coastfile] [-e earthmask] [-r devrate]\n", argv0);
 	exits("usage");
 }
 
@@ -427,10 +428,13 @@ main(int argc, char **argv)
 	Mouse m;
 	int e, oldbuttons;
 	int cx, cy, rad;
-	char *stationfile, *cfile;
+	char *stationfile, *cfile, *efile;
+	vlong now, lasttick;
+	double dtms;
 
 	stationfile = "/lib/radio/stations";
 	cfile = nil;
+	efile = nil;
 
 	ARGBEGIN{
 	case 's':
@@ -438,6 +442,9 @@ main(int argc, char **argv)
 		break;
 	case 'c':
 		cfile = EARGF(usage());
+		break;
+	case 'e':
+		efile = EARGF(usage());
 		break;
 	case 'r':
 		devrate = atoi(EARGF(usage()));
@@ -457,6 +464,9 @@ main(int argc, char **argv)
 	if(cfile != nil)
 		coastfile(cfile);
 	coastinit();
+	if(efile != nil)
+		earthfile(efile);
+	earthinit();
 	globeinit();
 
 	statbg = allocimage(display, Rect(0,0,1,1), screen->chan, 1, 0x141414ff);
@@ -465,6 +475,18 @@ main(int argc, char **argv)
 		fprint(2, "warning: could not load %s: %r\n", stationfile);
 
 	orbitinit(&orb, 0.0, 30.0, 1.0);
+	/*
+	 * Drive the spin off real elapsed time, not tick count: with
+	 * frictionref set, orbittick subdivides whatever ms we hand
+	 * it into Tickms-sized steps (see view.h), so a late tick
+	 * applies exactly the motion its elapsed time deserves.
+	 * Without this the trajectory depended on how many ticks we
+	 * managed to service -- with the per-pixel earth render a
+	 * frame can outlast the tick interval, so the spin advanced
+	 * slower than real time and decayed over a longer wall-clock
+	 * period than the flick implied: visibly "not keeping up."
+	 */
+	orb.frictionref = Tickms;
 	orb.zoommin = 0.5;
 	/*
 	 * 512x resolves same-city station clusters that 128x left
@@ -476,6 +498,7 @@ main(int argc, char **argv)
 	 */
 	orb.zoommax = 512.0;
 	oldbuttons = 0;
+	lasttick = nsec();	/* baseline for the Etick elapsed-time measurement */
 
 	redraw();
 
@@ -674,6 +697,42 @@ main(int argc, char **argv)
 
 		case Etick:
 			/*
+			 * Advance the spin by the time that actually
+			 * elapsed since the previous tick, not by a
+			 * nominal Tickms: ticks run late whenever a
+			 * frame outlasts the tick interval, and
+			 * charging each one a flat 25ms made the
+			 * animation lag real time and overstay its
+			 * decay.  orb.frictionref (set above) makes
+			 * orbittick subdivide this correctly.
+			 */
+			now = nsec();
+			dtms = (now - lasttick) / 1000000.0;
+			lasttick = now;
+			/*
+			 * Guards: a bogus clock reading shouldn't
+			 * teleport the globe (NOTES.md records a real
+			 * observed nsec() anomaly -- one reading ~23s
+			 * negative -- during the globebench work), and
+			 * neither should a genuine long stall (window
+			 * hidden, machine busy).  Fall back to one
+			 * nominal tick, and cap the catch-up.
+			 */
+			if(dtms <= 0.0)
+				dtms = Tickms;
+			if(dtms > 250.0)
+				dtms = 250.0;
+			/*
+			 * Physics first, unconditionally: it is a
+			 * handful of multiplies, and skipping it (as
+			 * the old ecankbd() early-out below did, by
+			 * breaking before this point) silently dropped
+			 * that interval's motion.  Only the expensive
+			 * part -- redraw -- is worth skipping.
+			 */
+			if(orbittick(&orb, dtms))
+				dirty = 1;
+			/*
 			 * If a keystroke (e.g. quit) is already
 			 * waiting, skip this tick's redraw and let
 			 * the loop go straight back to event() to
@@ -690,8 +749,6 @@ main(int argc, char **argv)
 			 */
 			if(ecankbd())
 				break;
-			if(orbittick(&orb, Tickms))
-				dirty = 1;
 			/*
 			 * Ticks pile up behind a slow redraw.  This
 			 * tick's physics is applied above, but if
@@ -714,9 +771,28 @@ main(int argc, char **argv)
 			 * (Selection-only changes bypass this entirely
 			 * via redrawsel(), which is cheap enough to run
 			 * per event.)
+			 *
+			 * With a solid earth loaded, motion frames
+			 * render at half resolution (globecoarse; the
+			 * per-pixel earth pass is the dominant frame
+			 * cost and can outlast the tick interval at
+			 * full window size, which is what made drag/
+			 * spin stutter and input go erratic behind the
+			 * backlogged frames).  When a tick finds no
+			 * motion left, one full-quality settle frame
+			 * re-renders the final view; discrete actions
+			 * (zoom, keyboard, menu) never set coarse and
+			 * so stay full quality.
 			 */
 			if(dirty){
 				dirty = 0;
+				globecoarse(1);
+				redraw();
+				globecoarse(0);
+				needfine = 1;
+			}
+			else if(needfine && !orb.dragging){
+				needfine = 0;
 				redraw();
 			}
 			break;

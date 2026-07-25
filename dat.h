@@ -15,6 +15,9 @@ struct Station {
 
 /* globe.c */
 void	globeinit(void);
+void	earthfile(char *path);	/* set explicit earth.mask path (-e) */
+void	earthinit(void);	/* load mask + build shading LUTs; silent no-op if no mask found */
+void	globecoarse(int c);	/* 1: half-res interactive earth rendering; 0: full quality */
 void	globegeom(Rectangle r, double zoom, int *cx, int *cy, int *rad);
 void	globedraw(Image *dst, Rectangle r, double clat, double clon, double zoom);
 void	geo2screen(Rectangle r, double clat, double clon, double zoom, Geo g, Point *p, int *visible);

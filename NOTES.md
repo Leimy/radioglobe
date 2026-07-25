@@ -22,8 +22,43 @@ play(1) to /dev/audio.
   aacdec).  HLS (.m3u8) still filtered - play/aacdec can't demux it.
 - Coastlines: runtime-loaded coast.dat from Natural Earth via
   mkcoast.  Looks much better than the old hand-typed data.
-- Source lives in /usr/dave/work/radioglobe (a stray /usr/dave/src
-  from earlier should be removed with `rm -r`).
+- Rendering as it stands now: a texture-mapped, lit globe.
+  With a real equirectangular photo (NASA Blue Marble) baked
+  by `mkearth -i`, drawearth() samples it bilinearly per pixel
+  through interpolated row/atan LUTs, so it stays smooth to the
+  512x zoom limit; the vector coastlines and grid are still
+  drawn on top.  Motion frames render at half resolution and a
+  full-quality settle frame follows when the motion stops, so
+  drag and spin are smooth despite the per-pixel cost.
+- Animation is frame-rate independent: momentum lives in
+  libview's Orbit, and radioglobe sets orb.frictionref = Tickms
+  and passes real elapsed nsec() time, so a flick covers the
+  same ground in the same wall-clock time at 8fps as at 40fps.
+  This replaced the earlier tick-count physics, which was the
+  actual cause of "the animation doesn't keep up / gets out of
+  sync."  See "The real 'animation gets out of sync' bug" below.
+- Dependency: libview (/usr/dave/work/libview) -- Vec3 helpers,
+  viewbasis(), and the Orbit inertial-drag state machine, shared
+  with claudegraph.  radioglobe links libview.a$O; the mkfile
+  rebuilds it from that work tree, so plain `mk` suffices.  The
+  converters do not link it.  See "libview" below.
+- Solid-earth mode (IMPLEMENTED): mkearth.c bakes an
+  equirectangular earth in one of two ways -- a land/ocean mask
+  from coast.dat (`mkearth < coast.dat > earth.mask`), or a real
+  RGB photo texture from an equirectangular world image like
+  NASA Blue Marble (`mkearth -i earth.plan9img > earth.mask`,
+  fed a Plan 9 image produced by `jpg -9 -t`).  If radioglobe
+  finds either kind of earth.mask (-e, or ./earth.mask, or
+  /lib/radio/earth.mask) it draws a shaded, lit, solid globe
+  (globe.c: earthinit()/drawearth()) instead of the flat ocean
+  disc, with the vector coastline outline and grid still drawn
+  on top from coast.dat as always.  Neither found -> unchanged
+  flat-disc rendering.  See "Solid-earth rendering" and "Real
+  photo texture support" below for how this differs from the
+  earlier tinyrenderer investigation (which is still just
+  parked/not used).
+- Source lives in /usr/dave/work/radioglobe.  (The stray
+  /usr/dave/src from early on is gone; nothing to clean up.)
 
 ### Next time / TODO shortlist
 - Confirm the pcmconv fix actually cured the speedup on real
@@ -34,6 +69,81 @@ play(1) to /dev/audio.
 - De-dup stations stacked on identical coordinates (many
   SomaFM/WALM/0N entries share one lat/lon -> overlapping dots).
 - ICY now-playing metadata (zuke has icy.c to borrow).
+
+## libview (shared view math)
+
+radioglobe no longer owns its view math.  /usr/dave/work/libview
+holds it, and claudegraph (/usr/dave/work/claude9/claudegraph.c)
+links the same archive; the point of the extraction was that both
+programs had already grown diverging copies of the same code,
+including the antimeridian wrap fix, which now exists in exactly
+one place.
+
+What radioglobe gets from it:
+
+  view.h    the API contract; requires u.h/libc.h first.  Don't
+            change signatures casually -- claudegraph compiles
+            against it too.
+  Vec3      x/y/z plus v3dot/v3len/... (dat.h's Station.vec and
+            Coastline.vec/center are Vec3).
+  viewbasis(yaw, pitch, &ex,&ey,&ez)
+            the screen basis; radioglobe maps lon->yaw,
+            lat->pitch and calls it once per frame, then projects
+            with three dot products (globe.c:vecproject()).
+            drawearth() uses the same basis for its per-pixel
+            inverse projection.
+  Orbit     yaw/pitch/zoom plus the inertial drag state machine:
+            orbitdown (grab stops the spin), orbitmove (wrap-safe
+            velocity across the +-180 seam), orbitup, orbittick,
+            orbitzoom, orbitnorm.  main.c's `orb` is the single
+            source of truth for the view; clat/clon/zoom no
+            longer exist as separate globals (globe.c's arguments
+            are still named clat/clon and are fed orb.pitch and
+            orb.yaw).
+
+radioglobe-specific settings applied after orbitinit(&orb, 0, 30,
+1): zoommin 0.5, zoommax 512 (raised from 128 to separate
+same-city station clusters), frictionref = Tickms (real-time
+decay, see below); pitch clamp and friction/vmin keep libview's
+defaults.  Drag sensitivity is passed per event as 180.0/rad,
+recomputed from globegeom().
+
+Library-side additions made for radioglobe are additive only:
+`Orbit.frictionref` defaults to 0, which reproduces the original
+per-call friction behavior bit-for-bit so claudegraph is
+unaffected.  libview has its own regression test
+(`cd /usr/dave/work/libview && mk && ./viewtest`), including
+testfrictionref, which asserts exactly that compatibility.
+
+## Repos and branches
+
+Three separate trees, and only two of them are git repos:
+
+  radioglobe  /usr/dave/work/radioglobe -- on branch `rendering`
+              (branches: front, rendering).  The texture-mapped
+              earth, the pacing/coarse-frame work and the
+              elapsed-time momentum all landed here.
+  libview     /usr/dave/work/libview -- on branch `front`, its
+              own repo.  Carries the additive `frictionref`
+              field, orbitstep() factoring, and the
+              testfrictionref regression test.
+  tr          /usr/dave/work/tr -- NOT a git repo (no .git).  The
+              tinyrenderer port plus globebench.c.  radioglobe
+              does not link or include anything from it; see the
+              investigation section below for what it was used
+              for, and note that globe.c's header comment and
+              this file both cite
+              /usr/dave/work/tr/p9/globebench.c, so those
+              references dangle for anyone who only has the
+              radioglobe repo.
+
+Order matters when pushing: radioglobe's mkfile points at the
+libview *work tree* by absolute path, so a fresh clone of
+radioglobe alone will not build.  Either push libview first and
+say so in its README's "Linking it into a consumer" terms
+(work-tree mode now, installed-copy mode -- $home/lib,
+$home/include -- once libview lives on its own), or vendor it.
+That decision is not made yet.
 
 ## Audio device rate (how to find / set it)
 
@@ -177,35 +287,66 @@ one per line.
 
 ## Files
 
-    main.c        event loop, UI, station mgmt, audio
-    globe.c       orthographic projection + rendering
-    coast.c       loads coast.dat at runtime
+    main.c        event loop, UI, station mgmt, audio, frame
+                  pacing, momentum tick (orbittick + real dt)
+    globe.c       orthographic projection + rendering, solid
+                  earth (land/ocean mask or photo texture),
+                  per-pixel shading, station dots + overlay
+    coast.c       loads coast.dat at runtime, chunks polylines
     dat.h         shared types
     mkcoast.c     GeoJSON coastline -> coast.dat
     mkstations.c  radio-browser JSON -> stations
+    mkearth.c     coast.dat -> earth.mask (land/ocean raster),
+                  or -i image -> earth.mask (RGB photo texture)
     util.c/util.h readall(), shared by the two converters
     stations      station list (generated, sample committed)
     coast.dat     coastline data (generated)
+    coast2.dat    higher-detail coastlines (generated, ~6x points)
+    stations2     larger station list (generated)
+    earth.mask    solid-earth data: land/ocean mask or photo
+                  texture (generated, optional)
     README        user-facing docs
     NOTES.md      this file
+    CODE-REVIEW.md  static review of the whole tree (2026-07-16);
+                  findings still open are listed there, not here
+
+Outside this directory:
+
+    /usr/dave/work/libview   Vec3 math, viewbasis(), Orbit
+                  inertial drag; linked as libview.a$O, shared
+                  with claudegraph (/usr/dave/work/claude9)
 
 ## Build
 
-    mk            builds radioglobe, mkcoast, mkstations
+    mk            builds libview (if stale), then radioglobe,
+                  mkcoast, mkstations, mkearth
     mk clean
+
+The mkfile carries `-I/usr/dave/work/libview` in CFLAGS, links
+`/usr/dave/work/libview/libview.a$O` into radioglobe only, and has
+a virtual rule that runs `mk` in the libview tree first, so a
+libview source change is picked up here without an `mk install`
+in between.  Do NOT run `mk clean all` in one invocation -- mk
+stats the object files before clean deletes them, decides they
+are up to date, and the link step then can't find them.
 
 ## Run
 
     radioglobe -s stations -c coast.dat   # explicit data files
+    radioglobe -e earth.mask              # solid-shaded globe
     radioglobe                            # uses /lib/radio/*
     radioglobe -r 48000                   # if /dev/audio is 48k
 
-Flags: -s stationfile  -c coastfile  -r devrate(Hz, default 44100)
+Flags: -s stationfile  -c coastfile  -e earthmask  -r devrate(Hz,
+default 44100)
+
+Generating the mask (optional; needs coast.dat first):
+    mkearth < coast.dat > earth.mask
 
 Install:
     mk install
     mkdir -p /lib/radio
-    cp stations coast.dat /lib/radio/
+    cp stations coast.dat earth.mask /lib/radio/
 
 ## Redraw performance (coastlines)
 
@@ -419,7 +560,17 @@ instead, like flicking a real globe. (a.k.a. "momentum scrolling" /
 "inertial rotation" / "flick to spin" -- the effect used in Google
 Earth, phone map apps, etc.)
 
-Implemented in main.c exactly per the plan below:
+**Where it lives now:** the state machine described below was
+implemented in main.c first (vlat/vlon and friction inline), and
+was later extracted verbatim into libview's `Orbit`
+(/usr/dave/work/libview/orbit.c: orbitdown/orbitmove/orbitup/
+orbittick, with vyaw/vpitch in place of vlon/vlat) so claudegraph
+and radioglobe stop carrying diverging copies of it.  main.c now
+owns only the timer, the elapsed-time measurement, and the redraw
+pacing; the physics is library code.  Read the bullets below as
+the design, not as a current file map.
+
+Implemented originally in main.c exactly per the plan below:
   - `etimer(Etick, Tickms)` (Etick=4, Tickms=25ms, ~40Hz) is
     started once after einit(); event(&ev) returns Etick like any
     other event key, handled by a `case Etick:` alongside
@@ -436,10 +587,17 @@ Implemented in main.c exactly per the plan below:
   - globe.c/coast.c untouched, as predicted -- this rode entirely
     on the existing redraw-cache machinery.
 
-Tuning knobs (main.c globals): Tickms, friction, vmin. Not yet
-hand-tuned against a real run; if it feels too "light" (stops
-too fast) raise friction toward 0.95-0.97; too "heavy"/floaty,
-lower it. Original design notes kept below for reference.
+Tuning knobs: `Tickms` is still a main.c enum (25ms, ~40Hz, and
+also what main.c hands to `orb.frictionref`); `friction` (0.92)
+and `vmin` (0.0005) are now Orbit fields with those defaults set
+by libview's orbitinit(), so tuning them means assigning
+`orb.friction` / `orb.vmin` in main() after orbitinit, not editing
+libview.  Not yet hand-tuned against a real run; if it feels too
+"light" (stops too fast) raise friction toward 0.95-0.97; too
+"heavy"/floaty, lower it.  Note that with frictionref set, the
+friction value is now per-Tickms-of-real-time rather than
+per-tick-event, which is what makes the feel independent of frame
+cost.  Original design notes kept below for reference.
 
 ### Original design (for reference)
 
@@ -841,13 +999,548 @@ Still open:
   same-cell dots at draw time; a fuller version would merge
   near-neighbors, show cluster counts, and cut hit-test cost).
 
+## Solid-earth rendering (IMPLEMENTED, mask-based)
+
+Landed a solid, lit, shaded globe, replacing the flat ocean disc
+when data is available -- but via a much simpler route than the
+separate tinyrenderer investigation below explored (which was
+NOT used/built). Worth reading this section before that one so
+the two don't get conflated.
+
+**What it is.** A new offline converter, mkearth.c, rasterizes
+coast.dat into an equirectangular (lat/lon) bitmap the same size
+class as a world map image, flood-fills ocean from a handful of
+known open-ocean seed points (4-connected, wrapping in longitude;
+anything the flood can't reach counts as land), and writes it as
+`earth.mask`:
+
+    mkearth [-w width] [-t preview.tga] < coast.dat > earth.mask
+
+`-w` sets mask width (height = width/2, default 2048x1024). `-t`
+dumps an unlit land/ocean preview .tga for eyeballing the result
+before trusting it. mkearth also prints the land percentage of the
+generated mask (Earth is ~30% land); a much lower number is the
+tell for a leak -- an unclosed ring in coast.dat that let the flood
+escape into a landmass and mark it ocean.
+
+**How radioglobe uses it (globe.c, main.c).** `-e file` (else
+./earth.mask, else /lib/radio/earth.mask; none found means the
+untouched flat-disc path) loads the mask at startup
+(`earthinit()`). When loaded, `globedraw()` calls `drawearth()`
+instead of drawing the flat ocean disc: for every disc pixel it
+inverts the orthographic projection analytically --
+
+    pz = sqrt(1 - px^2 - py^2)
+    world = px*ex + py*ey + pz*ez     (ex/ey/ez from viewbasis(), same as coastlines/stations)
+
+-- to get the 3D point on the unit sphere that projects there, looks
+up its lat/lon in the mask for land/ocean color, and shades it with
+a fixed viewer-attached light (`dl = dot(world, light)`, ambient
+floor + diffuse). No mesh, no z-buffer, no per-vertex anything: a
+single sphere under orthographic projection has a closed-form
+inverse per pixel, which is exactly what makes this route so much
+cheaper than a triangle rasterizer for this one shape. Two lookup
+tables (`rowlut`: sphere z -> mask row, avoiding per-pixel asin();
+`atanlut`: a quantized atan() for a hand-rolled `lutatan2()`, avoiding
+libc atan2() per pixel) keep the per-pixel cost to arithmetic plus
+two table reads. The composed image is built in a client-side RGB24
+buffer and shipped with one `loadimage()` + one `draw()`, not one
+draw-device call per pixel.
+
+Everything else is unchanged: the vector coastline outline, the
+lat/lon grid, and station dots are still drawn from coast.dat / the
+station file on top of the shaded sphere exactly as over the old
+flat disc (globedraw() calls drawgrid()/drawcoasts() either way), so
+the outline stays exact even though the fill beneath it is a
+rasterized approximation. The existing view-cache (`cache`, keyed
+on rect/clat/clon/zoom) covers `drawearth()` too -- it only re-runs
+when the view actually changes, same as the old ocean-disc fill did.
+
+**Relationship to the investigation below.** The tinyrenderer
+exploration (still parked, not built into radioglobe) was aimed at
+a general triangle-mesh-based solid globe with texture mapping,
+useful if a fully lit/normal-mapped/textured Earth render were
+wanted, or if the shape weren't a plain sphere. This implementation
+solves the much narrower, much cheaper problem radioglobe actually
+has -- "one sphere, orthographic view, need a land/ocean texture" --
+directly, without needing a mesh, a rasterizer port, or a photo
+texture at all: the "texture" is coast.dat's own vector data, baked
+once offline, which is exactly the "recommended starting point" the
+investigation below landed on. Consider the mesh/tinyrenderer route
+only if radioglobe ever wants something a single analytic sphere
+inverse can't give it (e.g. non-spherical geometry, real specular
+highlights needing surface normals beyond the sphere's own, or
+perspective camera dolly-zoom instead of orthographic scale-zoom).
+
+**Not done / possible follow-ups:** no night-side city-lights
+texture, no cloud layer, no seasonal terminator, no bump-mapped
+mountains -- the mask is a flat 1-bit land/ocean classification and
+the shading is a single fixed lamp direction, deliberately kept as
+simple as coast.dat's own outline rendering. mkearth's flood-seed
+list is hand-picked (Pacific/S.Atlantic/Indian/Arctic/Drake); a
+higher -w together with thinner straits in future coastline data
+could in principle pinch one shut again, same caveat mkearth.c's
+own comment already flags.
+
+### Real photo texture support (mkearth -i, EARTHTEX) -- IMPLEMENTED
+
+Follow-up landed after using the mask for a while: it's flat-colored
+(one fixed green for all land, one fixed blue for all ocean), so
+even lit it looks nothing like a satellite photo. Since the render
+path (`drawearth()`'s per-pixel inverse projection + lighting) was
+always going to need *some* w x h color source at (row, col), the
+natural extension was to let that source be a real photographic
+equirectangular texture -- e.g. NASA's public-domain "Blue Marble
+Next Generation" (visibleearth.nasa.gov) -- instead of only the
+computed land/ocean mask.
+
+**mkearth -i imagefile (mkearth.c):** a second, independent mode,
+mutually exclusive with the coast.dat path (it reads no stdin and
+ignores -w/-t). Converts an already-decoded Plan 9 image(6) file
+into an `EARTHTEX` block and exits:
+
+    jpg -9 -t earth.jpg > earth.plan9img   # -9: uncompressed image(6), -t: force RGB
+    mkearth -i earth.plan9img > earth.mask
+
+Why decode via jpg/png/tif(1) rather than link a JPEG/PNG/TIFF
+library into mkearth: those converters already exist in 9front and
+already do exactly this decode-to-image(6) step (see their `-9 -t`
+options); mkearth only needs libmemdraw, which was already going to
+be reachable for other reasons (memimage's channel-converting draw,
+below). One dependency instead of three image codec libraries.
+
+Implementation (mkearth.c:mktexture()): `readmemimage(fd)` (from
+libmemdraw, `#pragma lib "libmemdraw.a"` in memdraw.h -- no explicit
+mkfile change needed, confirmed by a clean build) loads the image(6)
+file into memory *without an open display connection*, which is
+exactly what a headless command-line converter needs (this is the
+same library the kernel's own draw(3) driver and page(1)/jpg(1) are
+built on). Whatever the source's actual channel format turns out to
+be, `memimagedraw()` into a freshly allocated RGB24 Memimage handles
+the conversion (grayscale, paletted, whatever -t already coerced it
+to) via the same channel-conversion machinery draw(2) uses on
+screen -- so mkearth doesn't need to special-case input formats
+itself. `unloadmemimage()` then hands back the pixel bytes already
+in RGB24's own in-memory order (B,G,R per image(6)'s documented
+convention for that channel string -- confirmed against globe.c's
+existing `ebuf` writes, which already use that exact order with
+`/* land: B */`-style comments). No resampling: output w/h are the
+source image's own, so whatever resolution you feed in is what
+`drawearth()` samples from later -- keep it to a few thousand pixels
+wide; the full-resolution multi-tile Blue Marble releases (tens of
+thousands of pixels per tile) are unnecessary for an on-screen disc
+and slow to load for no visible benefit.
+
+Written format:
+
+    EARTHTEX
+    w h
+    <w*h*3 raw bytes, row-major from the source image's own row 0
+     (must be the north pole, as with any standard equirectangular
+     world map): B,G,R per pixel>
+
+**globe.c:** `loadmask()` now recognizes either magic line
+(`EARTHMASK` or `EARTHTEX`) and allocates into one of two mutually
+exclusive buffers (`emask`, 1 byte/pixel, or `etex`, 3 bytes/pixel);
+a new `earthloaded` flag (replacing the old direct `emask != nil`
+checks in `globedraw()`) is set on success regardless of which
+format loaded. `drawearth()`'s inner pixel loop is unchanged up
+through computing `row`/`col` (the rowlut/atanlut machinery doesn't
+care what's stored at each cell) and only the final color lookup
+branches: `etex != nil` samples the real B,G,R bytes directly and
+multiplies by the same `inten` lighting term the flat-color path
+already used, so texture mode gets identical shading behavior, just
+a richer color source. Everything else -- the view-cache, the
+coastline/grid overlay drawn on top, the -e/./earth.mask/
+/lib/radio/earth.mask search order -- is untouched; both formats
+share the exact same `-e` flag and file slot, so switching between
+"a quick land/ocean mask" and "a real satellite photo" is just
+regenerating the same earth.mask with a different mkearth
+invocation.
+
+**Bilinear texel filtering (IMPLEMENTED, texture path only).**
+Confirmed in practice: at radioglobe's max zoom (512x) a single
+texel of a several-thousand-pixel-wide Blue Marble image covers
+many screen pixels, and the original nearest-neighbor lookup made
+that obvious as hard-edged blocks -- worse than the flat land/ocean
+mask ever looked, since a mask has no fine detail to lose in the
+first place. A bigger mask only pushes the same problem out further
+(and costs more memory/load time) rather than fixing it; the actual
+fix is interpolating *between* texels instead of snapping to one.
+
+`drawearth()` now computes the continuous (fractional) row/col
+position -- `idxf`/`colf` -- instead of only the rounded integer
+`row`/`col` the emask path still uses, and when `etex != nil` blends
+the 4 neighboring texels by fractional row/col (standard bilinear:
+weight each corner by `(1-frac)`/`frac` in both axes). The row
+fraction is obtained by interpolating between `rowlut[idx]` and
+`rowlut[idx+1]` -- i.e. within the existing LUT -- rather than
+calling `asin()` a second time, so the added cost is one more LUT
+read plus arithmetic, not trig. Longitude wraps (`col1` mod
+`emaskw`, since longitude is a full circle); latitude does not
+(`row1` clamps at the last row -- there's no wraparound over a
+pole). The emask (land/ocean flat-color) path deliberately keeps
+nearest-neighbor: its hard block edges are already covered by the
+exact vector coastline drawn on top, so blending there would only
+add cost (extra reads/lerps every pixel, every view-changing redraw)
+for a blur nobody would see under the crisp outline.
+
+Not pursued further: mipmapping / a proper minification filter for
+the opposite case (zoomed *out*, many texels per screen pixel,
+where bilinear alone can alias/shimmer on fine detail like small
+islands) -- not yet reported as visible in practice, and the
+existing coastline LOD stride already reduces the *vector* overlay's
+cost at low zoom the same way a mipmap would for the raster fill;
+worth adding only if the raster fill itself is seen to shimmer while
+zoomed out.
+
+### Deep-zoom blockiness round 2: it was our LUTs, not the texture
+
+Tested on the real Blue Marble texture at 512x: bilinear helped
+("softer") but blocks remained, and the obvious suspect -- texture
+resolution -- turned out not to be the main culprit.  Do the math
+before buying more pixels: on a ~1000px window at 512x, rad is
+~256,000 screen px.  lutatan2() was reading its LUT *without
+interpolation*, quantizing angles in ~1/Natan (1/1024) rad steps;
+its own comment correctly noted that was "well under one mask
+column," which is exactly why it was harmless under nearest-neighbor
+sampling.  But 1/1024 rad of longitude at 512x projects to ~250
+SCREEN pixels -- so the fractional column feeding the new bilinear
+blend was itself arriving in texel-sized stair-steps.  The filter
+smoothed within each step; the steps stayed.  Same story, milder,
+for rowlut, which stored integer (whole-row-quantized) values.
+
+Fix (globe.c): both LUT reads are now linearly interpolated between
+adjacent entries, and rowlut stores exact fractional double rows
+instead of rounded ushorts.  Quantization error drops from
+first-order (1/N per step) to second-order (~1e-7 rad) -- far below
+a texel at any reachable zoom -- for one extra multiply-add per
+lookup.  The emask nearest-neighbor path is unchanged in behavior
+((int) of the same values as before).
+
+Lesson recorded for next time: when a sampling artifact survives a
+filtering fix, check the *coordinate pipeline feeding the filter*
+before reaching for higher-resolution data.  Every stage upstream of
+the blend (LUTs here) must deliver precision finer than a texel at
+max zoom, or the filter just interpolates between quantized inputs.
+
+What genuinely remains after this fix is magnification blur, not
+blockiness: at 512x a 5400-wide texture texel legitimately covers
+~300 screen px at the equator (2*pi*256000/5400), rendered by
+bilinear as smooth gradients.  Real *detail* at that zoom would need
+on the order of a million-pixel-wide texture -- not loadable whole
+(21600x10800x3 is already ~700MB).  The realistic path, if ever
+wanted, is tiled multi-resolution loading (fetch/decode only the
+visible patch's tiles from the tiled full-res Blue Marble releases,
+which NASA distributes exactly for this reason) -- noted as a
+possible future direction, deliberately not started.
+
+### Interaction stutter round (solid-earth mode)
+
+Confirmed on real use with the Blue Marble texture: rendering
+quality good, but drag/spin stutters and input feels erratic.
+Diagnosis is arithmetic, not mystery: drawearth() recomputes every
+window pixel on every view-changing frame -- ~1M pixels of sqrt +
+interpolated-LUT lookups + bilinear blend, plus a ~3MB loadimage()
+per frame -- and once one frame outlasts the 25ms tick, the pacing
+machinery (which was designed for the far cheaper vector path)
+degrades: ticks coalesce, frames bunch, and mouse events get
+processed in bursts between slow frames.  The "erratic" feel is the
+same backlog disease documented in the drag-smoothness rounds above,
+reintroduced by a heavier per-frame cost.
+
+Two fixes landed (globe.c, one flag through dat.h/main.c):
+
+1. **Scanline span clipping (drawearth()).**  Per row, compute the
+   disc's x-extent analytically (|px| <= sqrt(1 - py^2)) and walk
+   only that span; the black margins are memset in bulk.  Zoomed
+   out, most of the window is margin, so this alone removes most of
+   the per-pixel work exactly where the whole hemisphere is visible
+   and the texture sampling is at its densest.  Also removes the
+   per-pixel outside-disc test everywhere except the span's edge
+   pixels.
+
+2. **Half-resolution motion frames (globecoarse()).**  While the
+   view is actually in motion (drag or momentum spin -- i.e. the
+   dirty-flag path in main.c's Etick), drawearth samples every
+   other pixel in x and y and replicates each sample into a 2x2
+   block: 4x fewer samples and 4x less loadimage traffic per frame.
+   When a tick finds no motion left, main.c renders one final
+   full-quality settle frame (needfine flag), so the image you
+   actually look at while stationary is always full resolution --
+   the softening exists only during motion, where it reads as
+   motion blur rather than lost detail.  The globedraw view-cache
+   is keyed on the quality flag too (ccoarse), so the settle frame
+   re-renders instead of blitting the coarse cache.  Discrete
+   actions (zoom, arrows, menu, click) never set coarse and stay
+   full quality; the flag is a no-op when no earth is loaded, so
+   the plain vector globe is untouched by any of this.
+
+Diagnosis aid: the status bar's ms readout shows the previous
+frame's cost.  Motion frames should now be roughly a quarter of
+what they were; if drag still stutters, read that number while
+dragging and report it -- the next lever, if one is ever needed, is
+parallelizing drawearth's row loop across cores (see the
+tinyrenderer investigation's fork-per-frame caveat: a persistent
+worker pool, not rfork/wait per frame, would be the right shape at
+40Hz).
+
+### The real "animation gets out of sync" bug: tick-count physics
+
+Follow-up report after the two fixes above: input itself was NOT
+bursty or laggy -- rather "the animation doesn't keep up and gets
+out of sync."  That is a different bug from frame cost, and the two
+cheap-frame fixes above could only ever hide it.
+
+Cause: the momentum physics was advanced by a FIXED Tickms (25ms)
+per tick *event*, and friction was applied once per tick *event*.
+So the spin's trajectory was measured in "ticks the application
+managed to service," not in wall-clock time.  Whenever a frame
+outlasted the tick interval -- which the per-pixel earth render can
+easily do -- ticks were serviced less often than every 25ms, so the
+spin advanced LESS than real time and (since friction is also
+per-tick) decayed over a LONGER wall-clock period than the flick
+implied.  Slow frames therefore didn't merely look choppy: they
+changed the animation's actual trajectory, which is precisely the
+"doesn't keep up / out of sync" symptom.  Two aggravating details in
+the same handler: the `ecankbd()` early-out `break`ed *before*
+orbittick(), silently discarding that interval's motion outright
+(previously noted here as harmless -- it was, for correctness, but
+it is exactly this class of drift), and tick coalescing via
+`ecanread(Etick)` intentionally serviced one tick per backlog.
+
+Fix, in two parts:
+
+1. **libview (view.h, orbit.c): `Orbit.frictionref`.**  New,
+   additive field: the caller's nominal tick length.  When set,
+   orbittick() subdivides whatever ms it is handed into steps of at
+   most frictionref, so one call with 4x the nominal interval
+   behaves *exactly* as four nominal calls would have (a trailing
+   partial step gets pow(friction, dt/ref)).  It defaults to 0,
+   which keeps the original one-friction-per-call behavior, so
+   claudegraph -- the other consumer, whose tick rate it can keep
+   up with -- is bit-for-bit unaffected; view.h's "don't change
+   signatures casually" contract is honored (no signature changed).
+   The legacy body was factored into a static orbitstep() so both
+   paths share one copy of the integration/clamp/wrap logic.
+2. **main.c: pass real elapsed time.**  The Etick handler now
+   measures nsec() since the previous tick and hands orbittick that
+   interval, with `orb.frictionref = Tickms` set at init.  Physics
+   moved *above* the ecankbd() early-out (it is a few multiplies;
+   only redraw is worth skipping), so a pending keystroke no longer
+   costs the spin an interval.  Guards: a non-positive delta falls
+   back to one nominal tick -- the globebench work in this file
+   recorded a real observed nsec() anomaly, one reading ~23s
+   negative, so this is not theoretical -- and the delta is capped
+   at 250ms so a genuine long stall (window hidden, machine busy)
+   makes the globe resume rather than teleport.
+
+Net effect: frame rate now affects only how *smoothly* the spin is
+sampled, not where it goes or how long it lasts.  A flick decays
+over the same wall-clock time at 8fps as at 40fps.
+
+Regression test added (libview/viewtest.c: testfrictionref):
+asserts 4 steps of ref == 1 step of 4*ref with frictionref set,
+that ms == frictionref is identical to the legacy single step, that
+the frictionref == 0 default still moves 4x as far and decays once
+for a 4x call (the claudegraph-compatibility guarantee), and that a
+zero interval is a no-op.  Run it with `cd /usr/dave/work/libview &&
+mk && ./viewtest` (one PASS/FAIL line per check; exits nil iff all
+pass).
+
+## Investigated: solid-shaded globe via software rasterization
+
+Question that prompted this: radioglobe draws coastlines as
+*outlines* (globe.c's own comment says why -- "filled continents
+require complex polygon clipping against the globe horizon...
+the outlines look fine"). Is that a real ceiling, or just the
+easier thing to build? Specifically: could a solid, lit, shaded
+sphere be rendered instead, using the tinyrenderer-style software
+triangle rasterizer ported to 9front at /usr/dave/work/tr/p9
+(geom.c/tga.c/model.c/ourgl.c -- a z-buffered, Phong-capable
+triangle rasterizer, unrelated to and not currently linked by
+radioglobe at all), and would it be fast enough to redraw on
+every drag/zoom event the way the current vector approach is?
+
+This was **investigated, not implemented** -- no radioglobe file
+was touched. The tool used to check lives in the tinyrenderer
+port tree: /usr/dave/work/tr/p9/globebench.c (`mk globebench`).
+It generates a UV-sphere mesh in memory (no .obj file needed --
+Model's fields are public) and shades it with a deliberately
+cheap Gouraud shader (ambient+diffuse only, solid ocean color, no
+texture, no normal map, no specular pow()) so the numbers measure
+the *floor* cost of "filled shaded sphere," not a fully-dressed
+Earth render. It times real frames (camera sweeping a full orbit,
+as if dragging) with nsec(), not shell `time`.
+
+### What it found, including two bugs the process itself caught
+
+1. **A benchmark usage bug**: per arg(2), option scanning stops at
+   the first argument that doesn't start with `-`. Running
+   `globebench 700 -p 4` silently stopped flag parsing at `700`,
+   so `-p` was *never applied* in the first round of testing --
+   three different `-p` values all secretly ran sequentially.
+   Fixed by rejecting stray positional args outright (`argc != 0`
+   -> usage()) instead of silently ignoring them.
+2. **A timer bug**: one nsec() reading came back ~23 seconds
+   *negative* out of 60 frames (nsec() reads /dev/bintime; cause
+   unconfirmed, possibly a one-off clock read glitch), which
+   silently wrecked the average until the stats code was hardened
+   to discard implausible (negative or >10s) deltas rather than
+   trust every reading.
+3. **A real, fixable inefficiency, found by the numbers not by
+   inspection**: the vertex shader was calling
+   `mat4invert_transpose(ModelView)` -- a full 4x4 cofactor-
+   expansion matrix inversion -- once per *vertex* (12288 times a
+   frame for a 4096-triangle sphere) instead of once per frame,
+   even though ModelView doesn't change within a frame. Hoisting
+   it into the per-frame shader init (semantically a no-op; same
+   output) gave a uniform ~41% speedup at every worker count
+   tested. The exact same inefficiency exists in the real
+   renderer's PhongShader::vertex() at /usr/dave/work/tr/p9/main.c
+   (inherited from the original tinyrenderer C++).  **Since
+   fixed there too:** that shader now hoists the inversion into
+   phonginit() (PhongShader.mvit), with a comment crediting this
+   benchmark; nothing left to do on that one.
+
+### Numbers (700x700 disc, 4096-triangle sphere, no texture)
+
+| workers | avg ms/frame | fps  |
+|---|---|---|
+| 1  | 33.58 | 29.8 |
+| 4  | 25.19 | 39.7 |
+| 10 | 40.12 | 24.9 (worse than sequential) |
+
+`-p 4` beats sequential but only by ~1.33x, well short of 4x;
+`-p 10` is worse than sequential outright. Two causes, both
+already-known limitations of the tinyrenderer port rather than
+surprises: (a) only fragment/scanline work is split across
+workers -- every worker still redundantly re-transforms the
+*entire* vertex set every frame, so that redundant cost scales
+*up* with worker count and fights the benefit of splitting
+fragment work; (b) the benchmark (like the real renderer)
+`rfork`s and `wait()`s fresh every single frame, which is fine for
+a batch renderer that runs once and exits but is the wrong shape
+for a 40Hz-or-more live redraw loop -- the fork/join overhead
+itself is a real, nonzero tax 60 times a second. `-p 10` losing
+to `-p 4` also suggests this machine has on the order of 4 usable
+cores; oversubscribing past that costs more than it returns.
+
+### Verdict
+
+**Not a hard ceiling.** ~30-40fps for a bare shaded sphere (no
+texture) is respectable -- draggable and readable, if not
+60fps-buttery. It is *nowhere near* as fast as what radioglobe
+does today (pure vector point-projection + a handful of
+poly()/fillellipse() calls, no per-pixel software shading loop at
+all -- almost certainly one or two orders of magnitude faster,
+effectively instant). So the honest framing is: solid shading is a
+real, buildable option that trades radioglobe's current
+unconditionally-smooth interaction for something in the
+"responsive but not instant" 25-40fps range, not a technical dead
+end. That's a product tradeoff for whoever owns this decision, not
+something the numbers settle by themselves. And this was all
+without a texture and without the heavier PhongShader-style
+normal-mapping/specular a real Earth render would likely want,
+which would cost more on top -- see below.
+
+### The texture problem (raised directly: "I don't have great
+map/texture data for the earth")
+
+Real concern, and the obvious answer ("go find a Blue Marble JPEG
+somewhere") has real friction (network fetch, license-checking,
+converting to TGA, and it'd be static/fixed detail regardless of
+zoom). But there's a much better option already sitting in this
+project: **coast.dat/coast2.dat already IS the land/ocean map** --
+it's just stored as vector polylines instead of a raster.
+Rasterizing those polylines into an equirectangular (lat/lon)
+bitmap -- flat 2D fill, ocean vs. land, once, offline, as a
+preprocessing step -- produces exactly the diffuse texture a
+solid-shaded sphere needs, using data this project already has and
+already trusts, at whatever resolution is wanted, with no network
+fetch and no new licensing question.
+
+This sidesteps the exact problem globe.c's own comment flags
+("filled continents require complex polygon clipping against the
+globe horizon") rather than solving it: clipping a filled polygon
+against a *3D view horizon on a rotating sphere, every frame* is
+the hard version of this problem. Filling the *same* polygons into
+a flat, static, non-rotating raster image *once* is the easy,
+textbook version (even-odd or nonzero scanline polygon fill,
+long-solved, no per-frame or per-view-angle cost at all) -- and
+once it's a flat bitmap, the tinyrenderer-style renderer just
+samples it as an ordinary diffuse texture the same way main.c
+samples diffuse.tga today. Not built; recorded here because it's
+the right next step if solid shading is ever pursued, and because
+it directly answers "no good texture data" with "you already have
+the data, it's just shaped as vectors."
+
+### "I also zoom in and out... would zoom work?"
+
+Yes, and it's not new work -- it's a knob the tinyrenderer port
+already exposes. Today's radioglobe zoom (globegeom(): rad =
+basereg * zoom) is a pure 2D scale of the projected disc; it
+doesn't move the camera in 3D or introduce perspective
+foreshortening. The renderer's `initviewport(x, y, w, h)` (see
+/usr/dave/work/tr/p9/ourgl.c) does exactly that same kind of
+screen-space scale already, independent of the 3D camera -- so
+replicating radioglobe's current zoom feel is a matter of passing
+`w = h = size*zoom` into initviewport() with eye/lookat held
+fixed, not a new capability that needs designing. (The other
+option, actually dollying the camera closer for a perspective
+zoom with real parallax, is also possible via lookat()'s eye
+distance, but would be a visual style change from radioglobe's
+current orthographic look, not a requirement.)
+
+One honest caveat, not a blocker: zooming in doesn't automatically
+make a frame cheaper the way it intuitively might. Fragment/pixel
+cost does shrink or grow with the visible area as expected, but
+*vertex-stage setup cost is currently paid for the entire mesh
+every frame regardless of what's actually on screen* (same
+limitation as the parallelism scaling issue above -- nothing culls
+or LODs the vertex pass). At deep zoom (radioglobe already goes up
+to 512x) most of a sphere mesh would be off-screen but still fully
+processed. This is exactly the class of problem globe.c/coast.c
+already solved for the vector path -- bounding-cap culling
+(capvisible()) and LOD striding (meanstep()-driven stride in
+drawcoasts()) -- so there's clear precedent in this codebase for
+how to fix it, if a mesh-based renderer is ever built: the same
+two ideas (skip what can't be visible, reduce detail below
+sub-pixel spacing) apply to triangles as much as to polyline
+points. Not needed to answer "would zoom work" (it would), only
+relevant to "would zoom make it faster" (not automatically, yet).
+
+### Status: parked (superseded for radioglobe's actual need)
+
+No radioglobe code was changed by this investigation, and still
+hasn't been -- this section remains an exploration of the general
+tinyrenderer/mesh route, kept for reference. The "texture-from-
+coast.dat" idea it landed on as the recommended starting point *was*
+picked up, but by a much smaller, purpose-built path instead of the
+mesh renderer: see "Solid-earth rendering (IMPLEMENTED, mask-based)"
+above, which added mkearth.c + globe.c:drawearth() using a per-pixel
+analytic sphere inverse (no mesh, no z-buffer, no fork-per-frame
+renderer process). That fully covers radioglobe's actual want ("a
+shaded globe instead of the flat disc, textured from data we
+already trust"). The mesh/tinyrenderer route stays parked and would
+only be worth revisiting for something an analytic single-sphere
+inverse genuinely can't do -- see that section's last paragraph.
+
 ## TODO / ideas
 
 - mixfs for playback (auto-resample + multiple simultaneous
   streams) instead of the pcmconv pipeline.
 - ICY now-playing metadata (zuke has icy.c to borrow).
 - Keyboard station search.
-- Filled landmasses (needs polygon clipping vs horizon circle).
+- Filled landmasses: DONE via a mask, not polygon clipping -- see
+  "Solid-earth rendering (IMPLEMENTED, mask-based)" above
+  (mkearth.c + globe.c:drawearth(), -e flag / earth.mask). The
+  mesh/tinyrenderer route explored separately in "Investigated:
+  solid-shaded globe via software rasterization" remains parked
+  and unused.
+  - Possible follow-ups on the mask itself: night-side city
+    lights, clouds, a seasonal terminator, bump-mapped terrain --
+    none implemented, see the notes above.
 - Cache fetched data, maybe a refresh command in the menu.
 - Cluster/de-dup nearby station dots when zoomed out.
 - Momentum/inertial spin on drag release: DONE (see above);
