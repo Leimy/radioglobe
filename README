@@ -5,21 +5,51 @@ DESCRIPTION
 	with radio station markers. Click a station to start
 	streaming. Drag to spin the globe. Scroll to zoom.
 
+	Given an earth file (see EARTH MASK), the globe is drawn
+	as a solid, lit sphere texture-mapped from a real
+	equirectangular satellite photo (or from a land/ocean mask
+	baked out of the coastline data), with bilinear texel
+	filtering; the vector coastlines and lat/lon grid are drawn
+	on top.  Releasing a drag leaves the globe spinning and it
+	eases to a stop, and motion frames are rendered at reduced
+	resolution so dragging and spinning stay smooth even with
+	the per-pixel textured earth.  Without an earth file the
+	rendering is the plain ocean disc plus coastline outlines.
+
 	Inspired by radio.garden, built for 9front.
 
 USAGE
-	radioglobe [-s stationfile] [-c coastfile] [-r devrate]
+	radioglobe [-s stationfile] [-c coastfile] [-e earthmask] [-r devrate]
 
 	The default station file is /lib/radio/stations and the
 	default coastline file is /lib/radio/coast.dat (also
 	searched for as ./coast.dat).  Samples can be generated
 	with the converters below.
 
+	-e names an earth mask file (see EARTH MASK below); if not
+	given, ./earth.mask and then /lib/radio/earth.mask are
+	tried.  If none of those exist, radioglobe falls back to
+	the flat ocean-disc + coastline-outline globe exactly as
+	before -- the earth mask is entirely optional.
+
 	-r sets the audio device sample rate in Hz (default 44100).
 	Use -r 48000 if your /dev/audio runs at 48 kHz.  See AUDIO.
 
 	To build everything:
 		mk
+
+	radioglobe links libview (/usr/dave/work/libview), the
+	shared view-math library that owns the Vec3 helpers, the
+	orbit-camera basis (viewbasis()) and the inertial-drag
+	state machine (Orbit/orbittick()); claudegraph links the
+	same library.  The mkfile rebuilds it from that work tree
+	automatically, so plain "mk" here is enough -- there is no
+	separate install step to remember.  The converters
+	(mkcoast, mkstations, mkearth) do not use it.
+
+	Note: run "mk clean" and "mk" as separate commands.  In one
+	invocation mk stats the object files before clean removes
+	them, then the link step cannot find them.
 
 	To install the binaries:
 		mk install
@@ -36,8 +66,9 @@ DATA
 
 	Coastlines come from Natural Earth (public domain) and
 	stations from radio-browser.info (open community database).
-	Two converters, built by mk, turn the raw downloads into
-	the formats radioglobe loads.
+	Three converters, built by mk, turn the raw downloads (plus,
+	for the earth mask, coast.dat itself) into the formats
+	radioglobe loads.
 
 	Coastlines.  Fetch a Natural Earth coastline GeoJSON, e.g.
 	the coarse 1:110m theme:
@@ -58,6 +89,28 @@ DATA
 	HLS (.m3u8) playlists are skipped by default since the
 	decoders cannot demux them.
 
+	Earth mask or texture (optional).  Bakes an equirectangular
+	earth for radioglobe's solid, lit, shaded globe mode (instead
+	of the flat ocean disc + coastline outlines), in one of two
+	ways:
+
+		mkearth < coast.dat > earth.mask
+
+	bakes a land/ocean mask from an existing coast.dat (flat,
+	generated colors), or
+
+		hget https://.../earth.jpg > /tmp/earth.jpg
+		jpg -9 -t /tmp/earth.jpg > /tmp/earth.plan9img
+		mkearth -i /tmp/earth.plan9img > earth.mask
+
+	converts a real equirectangular photo (e.g. NASA's public-
+	domain Blue Marble Next Generation, visibleearth.nasa.gov)
+	into an RGB texture instead.  Both write the same earth.mask
+	file radioglobe loads via -e; see EARTH MASK below for both
+	formats and rendering notes.  Without an earth.mask,
+	radioglobe is unchanged -- this is a purely additive
+	rendering mode.
+
 CONTROLS
 	Mouse:
 		Button 1 drag   spin the globe
@@ -66,6 +119,18 @@ CONTROLS
 		Scroll up       zoom in
 		Scroll down     zoom out
 
+	Releasing a button-1 drag hands the globe its launch
+	velocity: it keeps spinning and eases to a stop under
+	friction, like flicking a real globe.  Grabbing it again
+	stops it dead.  The spin decays in wall-clock time rather
+	than per rendered frame, so a flick lasts the same length
+	whether frames are cheap (plain vector globe) or expensive
+	(textured earth at full window size).
+
+	Zoom runs from 0.5x to 512x.  Deep zoom exists mostly to
+	separate stations packed into one city; stations at exactly
+	identical coordinates can never be separated by zooming.
+
 	Keyboard:
 		arrows          rotate view
 		+/-             zoom in/out
@@ -73,6 +138,25 @@ CONTROLS
 		space/enter     play selected station
 		s or .          stop playback
 		q or Del        quit
+
+STATUS BAR
+	The strip along the bottom of the window shows, in order of
+	precedence: the playing station (and the hovered one after
+	a "|" if they differ), or the hovered station with its
+	coordinates, or -- when nothing is playing or hovered --
+	the view center, the zoom factor, and the cost in
+	milliseconds of the previous rendered frame.
+
+	That millisecond figure is the diagnostic to read first if
+	interaction ever feels rough: a large number means frames
+	are simply expensive (strobing/low frame rate), a small one
+	with visible flicker only during motion means presentation
+	tearing (nothing left to fix in the application), and
+	flicker on a completely idle globe means a stale binary or
+	something outside radioglobe.  Hovering stations does not
+	recompute it, so if the number changes while you merely
+	wave the mouse over dots, the running binary is older than
+	the selection-overlay work: mk install.
 
 STATION FILE FORMAT
 	Lines of the form:
@@ -91,6 +175,81 @@ COASTLINE FILE FORMAT
 		lat lon
 	in decimal degrees.  Blank lines and lines starting with
 	# are ignored.  This is what mkcoast emits.
+
+EARTH MASK
+	earth.mask is a baked equirectangular earth, generated
+	offline by mkearth, in one of two formats (radioglobe
+	auto-detects which one from the file's first line):
+
+	Land/ocean mask, from coast.dat:
+
+		mkearth [-w width] [-t preview.tga] < coast.dat > earth.mask
+
+	-w sets the mask width in pixels (height is always width/2);
+	default 2048.  -t writes a preview .tga (land/ocean, unlit)
+	alongside the mask for eyeballing the result.  File format:
+
+		EARTHMASK
+		w h
+		<w*h raw bytes, row-major from the north pole:
+		 1=land 0=ocean>
+
+	mkearth rasterizes every coastline segment from coast.dat
+	into the grid, then flood-fills ocean from a handful of
+	known open-ocean seed points; anything the flood cannot
+	reach counts as land.  This means closed seas whose ring is
+	present in the data (e.g. the Caspian) come out as land, and
+	Antarctica needs no special-casing.  It also means an
+	unclosed coastline ring in the source data would leak the
+	flood into that landmass and mark it ocean by mistake --
+	mkearth prints the resulting land percentage (~30% is
+	correct for Earth) as a sanity check; a much lower number
+	means a leak, diagnosable with -t.
+
+	Real photo texture, from an equirectangular world image
+	(e.g. NASA Blue Marble Next Generation):
+
+		jpg -9 -t earth.jpg > earth.plan9img   # -9: uncompressed image(6); -t: force RGB
+		mkearth -i earth.plan9img > earth.mask
+
+	imagefile must be an UNCOMPRESSED Plan 9 image(6) file --
+	produce one from a JPEG/PNG/TIFF with jpg/png/tif's -9 -t
+	options (see jpg(1)).  No resampling is done: whatever
+	resolution you feed in is what radioglobe samples from, so
+	pick something reasonable (a few thousand pixels wide is
+	plenty; the full-resolution multi-tile Blue Marble releases,
+	tens of thousands of pixels wide, are overkill for an
+	on-screen globe and slow to load).  Texture samples are
+	bilinear-filtered (the land/ocean mask stays nearest-
+	neighbor, since its hard block edges are already covered by
+	the exact vector coastline drawn on top), so a modest
+	resolution still looks smooth even zoomed all the way in --
+	you do not need to chase a bigger image to fix blockiness.
+	File format:
+
+		EARTHTEX
+		w h
+		<w*h*3 raw bytes, row-major from the image's own row 0
+		 (must be the north pole, as in any standard
+		 equirectangular world map): B,G,R per pixel>
+
+	In both cases, when radioglobe finds an earth.mask (via -e,
+	or ./earth.mask, or /lib/radio/earth.mask, in that order), it
+	switches from the flat ocean-disc rendering to a solid, lit,
+	shaded globe: each visible screen pixel is projected back
+	onto the sphere (exact for an orthographic view of a single
+	sphere -- no mesh, no z-buffer needed) and looked up in the
+	mask/texture for its color (land/ocean flat color, or the
+	real photo's RGB), then shaded by a fixed viewer-attached
+	light.  The vector coastline outlines and lat/lon grid are
+	still drawn on top from coast.dat as before, so the visible
+	outline stays exact even though the fill underneath it is a
+	raster approximation.  While the globe is being dragged or is
+	spinning, the shaded fill renders at reduced resolution to
+	keep the motion smooth and sharpens automatically the moment
+	it stops; the outlines, grid, and station dots stay full
+	resolution throughout.  With no earth.mask found, rendering
+	is identical to a build with none at all.
 
 AUDIO
 	Playback runs this rc pipeline per station:
@@ -129,12 +288,29 @@ REQUIREMENTS
 	webfs(4) must be mounted for HTTP streaming to work.
 	Typically this is already running under rio.
 
+	libview must be present at /usr/dave/work/libview; mk
+	builds it as part of building radioglobe.
+
 SOURCE
-	main.c         event loop, UI, station management
-	globe.c        orthographic projection, rendering
-	coast.c        loads coast.dat at runtime
+	main.c         event loop, UI, station management, audio,
+	               frame pacing and the momentum tick
+	globe.c        orthographic projection, rendering, solid
+	               earth (land/ocean mask or photo texture),
+	               per-pixel shading and station dots
+	coast.c        loads coast.dat at runtime, chunks polylines
 	dat.h          shared types
+	util.h util.c  helpers shared by the converters
 	mkcoast.c      GeoJSON coastline -> coast.dat
 	mkstations.c   radio-browser JSON -> stations
-	util.c         helpers shared by the converters
+	mkearth.c      coast.dat -> earth.mask land/ocean raster,
+	               or (-i) a Plan 9 image -> RGB earth texture
 	NOTES.md       project notes / how to resume work
+	CODE-REVIEW.md static review of the whole tree
+
+	Not in this directory:
+
+	libview        /usr/dave/work/libview -- Vec3 math, the
+	               orbit-camera view basis and the inertial
+	               drag/momentum state machine, shared with
+	               claudegraph.  Linked as libview.a$O; see
+	               that tree's README.

@@ -1,6 +1,7 @@
 #include <u.h>
 #include <libc.h>
 #include <draw.h>
+#include <bio.h>
 #include "view.h"
 #include "dat.h"
 
@@ -31,6 +32,68 @@ static Image *cache;
 static Rectangle cacherect;
 static double cclat, cclon, czoom;
 static int cachevalid;
+static int ccoarse;	/* quality the cache was rendered at; see globecoarse */
+
+/*
+ * Solid-earth mode: an equirectangular earth baked by mkearth(1),
+ * either a land/ocean mask from coast.dat or a real RGB texture
+ * from a photo (mkearth -i; e.g. NASA Blue Marble).  When either is
+ * loaded (earthinit), the flat fillellipse ocean disc is replaced
+ * by a per-pixel shaded, textured sphere (drawearth below); when
+ * neither is found, earthloaded stays 0 and every code path is
+ * exactly as before.
+ *
+ * Why per-pixel inverse projection rather than a triangle mesh:
+ * for a single sphere under this orthographic projection, each
+ * disc pixel maps back onto the sphere analytically --
+ *   pz = sqrt(1 - px^2 - py^2)
+ *   world = px*ex + py*ey + pz*ez     (the existing viewbasis!)
+ * -- so there is no mesh, no z-buffer, and zoom works unchanged
+ * through globegeom()'s rad.  Benchmarked first via
+ * /usr/dave/work/tr/p9/globebench.c (see radioglobe NOTES.md); the
+ * per-pixel budget is affordable if the lat/lon texture lookup
+ * avoids per-pixel asin/atan2 library calls, hence the two LUTs.
+ * Lighting is a viewer-attached lamp expressed in VIEW space, so
+ * it needs no world transform at all (the basis is orthonormal).
+ *
+ * emask (1 byte/pixel, 1=land 0=ocean) and etex (3 bytes/pixel,
+ * B,G,R -- matching Image channel RGB24's own in-memory byte
+ * order, see image(6)) are mutually exclusive: exactly one of them
+ * is non-nil after a successful load, selected by which magic
+ * string ("EARTHMASK" or "EARTHTEX") the file starts with.
+ * emaskw/emaskh describe whichever one is active.
+ */
+static uchar *emask;
+static uchar *etex;
+static int emaskw, emaskh;
+static char *earthpath;
+static int earthloaded;
+
+enum {
+	Nasin	= 2048,		/* p.z -> mask row LUT resolution */
+	Natan	= 1024,		/* atan ratio LUT resolution */
+};
+/*
+ * rowlut stores *fractional* rows (doubles, the exact
+ * (0.5 - asin(z)/PI) * emaskh position, clamped to [0, emaskh-1]),
+ * not rounded integers, and both LUTs are read with linear
+ * interpolation between adjacent entries (see lutatan2 and
+ * drawearth).  With plain quantized reads the LUT step itself
+ * becomes visible at deep zoom: 1/Natan rad of longitude is ~250
+ * screen pixels at 512x on a ~1000px window, so bilinear texel
+ * filtering downstream was being fed column positions that moved
+ * in texel-sized stair-steps -- still blocky, just with soft
+ * edges.  Interpolated reads make the error second-order (~1e-7
+ * rad), far below a texel at any reachable zoom, for one extra
+ * multiply-add per lookup.
+ */
+static double *rowlut;
+static double *atanlut;
+static double lightx, lighty, lightz;
+
+static uchar *ebuf;		/* client-side RGB24 pixel buffer */
+static Image *eimg;
+static Rectangle erect;
 
 void
 globeinit(void)
@@ -42,6 +105,415 @@ globeinit(void)
 	dotcol = allocimage(display, Rect(0,0,1,1), screen->chan, 1, 0x44dd88ff);
 	dotsel = allocimage(display, Rect(0,0,1,1), screen->chan, 1, 0xff8844ff);
 	textcol = allocimage(display, Rect(0,0,1,1), screen->chan, 1, DWhite);
+}
+
+void
+earthfile(char *path)
+{
+	earthpath = path;
+}
+
+/*
+ * Interactive quality knob: while the view is being dragged or is
+ * spinning, main.c turns coarse mode on so drawearth samples at
+ * half resolution (replicating each sample into a 2x2 block --
+ * 4x fewer per-pixel computations and 4x less loadimage traffic
+ * per frame), then renders one final full-resolution frame when
+ * the motion stops.  The globedraw cache is keyed on this too, so
+ * that settle frame actually re-renders instead of reusing the
+ * coarse cache.  No-op when no earth is loaded: the flat-disc
+ * path has no per-pixel cost to reduce, and keeping the flag at 0
+ * lets the settle frame hit the cache instead of re-rendering.
+ */
+static int ecoarse;
+
+void
+globecoarse(int c)
+{
+	ecoarse = earthloaded ? c : 0;
+}
+
+static int
+loadmask(char *path)
+{
+	Biobuf *b;
+	char *ln, *f[2];
+	int w, h, istex;
+	long n;
+
+	b = Bopen(path, OREAD);
+	if(b == nil)
+		return -1;
+	ln = Brdline(b, '\n');
+	if(ln == nil){
+		Bterm(b);
+		return -1;
+	}
+	if(Blinelen(b) >= 9 && strncmp(ln, "EARTHMASK", 9) == 0)
+		istex = 0;
+	else if(Blinelen(b) >= 8 && strncmp(ln, "EARTHTEX", 8) == 0)
+		istex = 1;
+	else{
+		Bterm(b);
+		return -1;
+	}
+	ln = Brdline(b, '\n');
+	if(ln == nil){
+		Bterm(b);
+		return -1;
+	}
+	ln[Blinelen(b)-1] = 0;
+	if(tokenize(ln, f, 2) != 2){
+		Bterm(b);
+		return -1;
+	}
+	w = atoi(f[0]);
+	h = atoi(f[1]);
+	if(w < 4 || h < 2 || w > 16384 || h > 8192){
+		Bterm(b);
+		return -1;
+	}
+	n = (long)w*h*(istex ? 3 : 1);
+	if(istex){
+		etex = malloc(n);
+		if(etex == nil)
+			sysfatal("malloc: %r");
+		if(Bread(b, etex, n) != n){
+			free(etex);
+			etex = nil;
+			Bterm(b);
+			return -1;
+		}
+	}else{
+		emask = malloc(n);
+		if(emask == nil)
+			sysfatal("malloc: %r");
+		if(Bread(b, emask, n) != n){
+			free(emask);
+			emask = nil;
+			Bterm(b);
+			return -1;
+		}
+	}
+	emaskw = w;
+	emaskh = h;
+	Bterm(b);
+	return 0;
+}
+
+/*
+ * Load the earth mask (explicit -e path, else ./earth.mask, else
+ * /lib/radio/earth.mask; none found means the flat-disc rendering
+ * stays) and precompute the per-pixel shading tables:
+ *   rowlut: p.z in [-1,1] -> mask row, replacing per-pixel asin()
+ *   atanlut: t in [0,1] -> atan(t), used by lutatan2() below
+ * plus the normalized view-space light direction.
+ */
+void
+earthinit(void)
+{
+	int i;
+	double z, t, len;
+
+	if(earthpath != nil){
+		/* named explicitly: failing loudly beats a silent flat globe */
+		if(loadmask(earthpath) != 0)
+			sysfatal("cannot load earth mask %s", earthpath);
+	}
+	else if(loadmask("earth.mask") != 0 && loadmask("/lib/radio/earth.mask") != 0)
+		return;
+	earthloaded = 1;
+
+	rowlut = malloc((Nasin+1)*sizeof(double));
+	atanlut = malloc((Natan+1)*sizeof(double));
+	if(rowlut == nil || atanlut == nil)
+		sysfatal("malloc: %r");
+	for(i = 0; i <= Nasin; i++){
+		z = 2.0*i/Nasin - 1.0;
+		if(z < -1.0)
+			z = -1.0;
+		if(z > 1.0)
+			z = 1.0;
+		t = (0.5 - asin(z)/PI) * emaskh;
+		if(t < 0.0)
+			t = 0.0;
+		if(t > emaskh-1)
+			t = emaskh-1;
+		rowlut[i] = t;
+	}
+	for(i = 0; i <= Natan; i++)
+		atanlut[i] = atan((double)i/Natan);
+
+	/* viewer-attached lamp: from the upper left, mostly frontal */
+	lightx = -0.35;
+	lighty = 0.45;
+	lightz = 0.82;
+	len = sqrt(lightx*lightx + lighty*lighty + lightz*lightz);
+	lightx /= len;
+	lighty /= len;
+	lightz /= len;
+}
+
+/*
+ * atan2 via the atan LUT: octant reduction, then an interpolated
+ * table lookup on the min/max ratio.  Reading the nearest entry
+ * alone quantizes the angle in ~1/Natan rad steps -- harmless when
+ * the result was rounded to a texel column anyway (nearest-neighbor
+ * sampling), but at 512x zoom one such step spans hundreds of
+ * screen pixels and stair-steps the fractional column that bilinear
+ * texture filtering needs.  Linear interpolation between adjacent
+ * entries cuts the error to second order (~1e-7 rad, far below a
+ * texel at any reachable zoom) for one extra multiply-add.
+ */
+static double
+lutatan2(double y, double x)
+{
+	double ax, ay, a, t, f;
+	int i;
+
+	ax = fabs(x);
+	ay = fabs(y);
+	if(ax + ay < 1e-12)
+		return 0.0;	/* looking dead at a pole */
+	if(ax >= ay)
+		t = ay/ax*Natan;
+	else
+		t = ax/ay*Natan;
+	i = (int)t;
+	if(i >= Natan)
+		i = Natan-1;	/* ratio == 1.0 exactly: f becomes 1 */
+	f = t - i;
+	a = atanlut[i] + f*(atanlut[i+1] - atanlut[i]);
+	if(ax < ay)
+		a = PI/2.0 - a;
+	if(x < 0)
+		a = PI - a;
+	if(y < 0)
+		a = -a;
+	return a;
+}
+
+/*
+ * Render the shaded, textured globe into dst over rectangle r:
+ * per-pixel inverse orthographic projection against the current
+ * view basis, land/ocean color from the mask, diffuse+ambient
+ * lighting from the view-space lamp.  Pixels outside the disc are
+ * painted black, so this replaces both the background fill and
+ * the fillellipse ocean disc.  The pixels are composed in a
+ * client-side buffer and shipped with one loadimage() + one
+ * draw() -- per-pixel draw operations would be one protocol
+ * message each.
+ *
+ * Called only from globedraw()'s cache-regeneration block, so it
+ * runs when (rect, clat, clon, zoom) actually changed, at most
+ * once per tick, and hover/status redraws reuse the cached result.
+ */
+static void
+drawearth(Image *dst, Rectangle r, double clat, double clon, double zoom)
+{
+	int x, y, w, h, cx, cy, rad, row, col, idx, stride;
+	int row0, row1, col0, col1, x0, x1, xstep, ystep;
+	double scale, px, py, pz, rr, wx, wy, wz, dl, inten;
+	double idxf, rowf, colf, fracx, fracy;
+	double bb, gg, rrr, w00, w01, w10, w11;
+	double s2, halfw;
+	uchar *bp, *rowp, *p00, *p01, *p10, *p11;
+	Vec3 ex, ey, ez;
+
+	w = Dx(r);
+	h = Dy(r);
+	if(eimg == nil || !eqrect(erect, r)){
+		if(eimg != nil)
+			freeimage(eimg);
+		free(ebuf);
+		eimg = allocimage(display, r, RGB24, 0, DNofill);
+		ebuf = malloc((long)w*3*h);
+		if(eimg == nil || ebuf == nil)
+			sysfatal("allocimage: %r");
+		erect = r;
+	}
+
+	globegeom(r, zoom, &cx, &cy, &rad);
+	viewbasis(clon, clat, &ex, &ey, &ez);
+	scale = 1.0 / rad;
+	stride = w*3;
+
+	/*
+	 * Interactive (coarse) mode: sample every other pixel in x
+	 * and y and replicate into 2x2 blocks; main.c renders one
+	 * full-resolution frame when the motion stops (see
+	 * globecoarse above).
+	 */
+	xstep = ystep = ecoarse ? 2 : 1;
+
+	for(y = r.min.y; y < r.max.y; y += ystep){
+		rowp = ebuf + (long)(y - r.min.y)*stride;
+		py = (cy - y) * scale;
+
+		/*
+		 * Row span of the disc: pixels with |px| beyond
+		 * sqrt(1 - py^2) cannot be on the sphere, so memset
+		 * the black margins in bulk and walk only the span.
+		 * Zoomed out this skips most of the window per row;
+		 * everywhere it removes the per-pixel outside-disc
+		 * test from all but the span's edge pixels.
+		 */
+		s2 = 1.0 - py*py;
+		if(s2 > 0.0){
+			halfw = sqrt(s2) * rad;
+			x0 = cx - (int)halfw;
+			x1 = cx + (int)halfw;
+			if(x0 < r.min.x)
+				x0 = r.min.x;
+			if(x1 > r.max.x-1)
+				x1 = r.max.x-1;
+		}else{
+			x0 = 0;
+			x1 = -1;	/* row entirely off the sphere */
+		}
+		if(x0 > x1){
+			memset(rowp, 0, stride);
+			if(ystep == 2 && y+1 < r.max.y)
+				memset(rowp+stride, 0, stride);
+			continue;
+		}
+		memset(rowp, 0, 3*(x0 - r.min.x));
+		memset(rowp + 3*((x1+1) - r.min.x), 0, 3*(r.max.x - (x1+1)));
+
+		bp = rowp + 3*(x0 - r.min.x);
+		for(x = x0; x <= x1; x += xstep, bp += 3*xstep){
+			px = (x - cx) * scale;
+			rr = px*px + py*py;
+			if(rr > 1.0){
+				bp[0] = 0;	/* span edge: still off-sphere */
+				bp[1] = 0;
+				bp[2] = 0;
+				if(xstep == 2 && x+1 <= x1){
+					bp[3] = 0;
+					bp[4] = 0;
+					bp[5] = 0;
+				}
+				continue;
+			}
+			pz = sqrt(1.0 - rr);
+
+			/* back onto the sphere: world = px*ex + py*ey + pz*ez */
+			wx = px*ex.x + py*ey.x + pz*ez.x;
+			wy = px*ex.y + py*ey.y + pz*ez.y;
+			wz = px*ex.z + py*ey.z + pz*ez.z;
+
+			/*
+			 * idxf/colf are the *continuous* (fractional)
+			 * row/col position before any rounding -- kept
+			 * around for etex's bilinear sample below.  The
+			 * plain rounded row/col (used by the emask
+			 * nearest-neighbor path, and as etex's fallback
+			 * if bilinear is ever skipped) are still derived
+			 * the same way as before.
+			 */
+			idxf = (wz + 1.0) * 0.5 * Nasin;
+			if(idxf < 0)
+				idxf = 0;
+			if(idxf > Nasin)
+				idxf = Nasin;
+			idx = (int)idxf;
+			if(idx >= Nasin)
+				idx = Nasin-1;
+			row = (int)rowlut[idx];
+
+			colf = (lutatan2(wy, wx) + PI) * (1.0/(2.0*PI)) * emaskw;
+			if(colf >= emaskw)
+				colf -= emaskw;
+			if(colf < 0)
+				colf += emaskw;
+			col = (int)colf;
+			if(col >= emaskw)
+				col = emaskw-1;
+
+			/* lamp is in view space: no world transform needed */
+			dl = px*lightx + py*lighty + pz*lightz;
+			if(dl < 0)
+				dl = 0;
+			inten = 0.35 + 0.70*dl;
+			if(inten > 1.0)
+				inten = 1.0;
+
+			if(etex != nil){
+				/*
+				 * Real photo texture (mkearth -i):
+				 * bilinear-filtered sample of the
+				 * stored B,G,R bytes (already in
+				 * RGB24's own byte order, see
+				 * loadmask/mkearth.c).  Nearest-
+				 * neighbor left every mask/texel cell
+				 * a hard-edged block; at high zoom
+				 * (radioglobe's max is 512x) a single
+				 * texel can cover many screen pixels,
+				 * so blending the 4 neighboring texels
+				 * by fractional row/col turns that
+				 * blockiness into a smooth gradient --
+				 * a real resolution increase would only
+				 * push the same problem out further.
+				 *
+				 * fracy interpolates within the row LUT
+				 * itself (between rowlut[idx] and
+				 * rowlut[idx+1], which store exact
+				 * fractional rows) rather than reading
+				 * asin() again, so this stays LUT-cost,
+				 * not trig-cost, per pixel.  Longitude
+				 * wraps (col1 mod emaskw); latitude does
+				 * not (row1 clamps at the last row --
+				 * there's no wraparound over a pole).
+				 */
+				fracy = idxf - idx;
+				rowf = rowlut[idx] + fracy*(rowlut[idx+1] - rowlut[idx]);
+				row0 = (int)rowf;
+				if(row0 >= emaskh-1)
+					row0 = emaskh-2 >= 0 ? emaskh-2 : 0;
+				row1 = row0+1;
+				fracy = rowf - row0;
+
+				col0 = (int)colf;
+				fracx = colf - col0;
+				col1 = col0+1;
+				if(col1 >= emaskw)
+					col1 = 0;
+
+				p00 = etex + ((long)row0*emaskw + col0)*3;
+				p01 = etex + ((long)row0*emaskw + col1)*3;
+				p10 = etex + ((long)row1*emaskw + col0)*3;
+				p11 = etex + ((long)row1*emaskw + col1)*3;
+				w00 = (1-fracx)*(1-fracy);
+				w01 = fracx*(1-fracy);
+				w10 = (1-fracx)*fracy;
+				w11 = fracx*fracy;
+				bb  = p00[0]*w00 + p01[0]*w01 + p10[0]*w10 + p11[0]*w11;
+				gg  = p00[1]*w00 + p01[1]*w01 + p10[1]*w10 + p11[1]*w11;
+				rrr = p00[2]*w00 + p01[2]*w01 + p10[2]*w10 + p11[2]*w11;
+				bp[0] = (uchar)(bb * inten);
+				bp[1] = (uchar)(gg * inten);
+				bp[2] = (uchar)(rrr * inten);
+			}else if(emask[(long)row*emaskw + col]){
+				bp[0] = (uchar)(0x5a * inten);	/* land: B */
+				bp[1] = (uchar)(0x8a * inten);	/* G */
+				bp[2] = (uchar)(0x4a * inten);	/* R */
+			}else{
+				bp[0] = (uchar)(0x50 * inten);	/* ocean: B */
+				bp[1] = (uchar)(0x28 * inten);	/* G */
+				bp[2] = (uchar)(0x10 * inten);	/* R */
+			}
+			if(xstep == 2 && x+1 <= x1){
+				bp[3] = bp[0];	/* coarse: replicate right */
+				bp[4] = bp[1];
+				bp[5] = bp[2];
+			}
+		}
+		if(ystep == 2 && y+1 < r.max.y)
+			memcpy(rowp+stride, rowp, stride);	/* coarse: replicate the row below */
+	}
+
+	loadimage(eimg, eimg->r, ebuf, (long)stride*h);
+	draw(dst, r, eimg, nil, r.min);
 }
 
 /*
@@ -362,7 +834,8 @@ globedraw(Image *dst, Rectangle r, double clat, double clon, double zoom)
 	 * of those is the expensive part we don't need to repeat.
 	 */
 	if(!cachevalid || !eqrect(cacherect, r) ||
-	   clat != cclat || clon != cclon || zoom != czoom){
+	   clat != cclat || clon != cclon || zoom != czoom ||
+	   ecoarse != ccoarse){
 		/*
 		 * Only (re)allocate the offscreen cache image when its
 		 * rectangle actually changes (i.e. a window resize).
@@ -383,11 +856,21 @@ globedraw(Image *dst, Rectangle r, double clat, double clon, double zoom)
 
 		globegeom(r, zoom, &cx, &cy, &rad);
 
-		/* background */
-		draw(cache, r, display->black, nil, ZP);
+		if(earthloaded){
+			/*
+			 * solid-earth mode: shaded, textured sphere
+			 * (land/ocean mask or real photo texture);
+			 * paints all of r (black outside the disc),
+			 * replacing background + ocean disc.
+			 */
+			drawearth(cache, r, clat, clon, zoom);
+		}else{
+			/* background */
+			draw(cache, r, display->black, nil, ZP);
 
-		/* globe disc */
-		fillellipse(cache, Pt(cx, cy), rad, rad, ocean, ZP);
+			/* globe disc */
+			fillellipse(cache, Pt(cx, cy), rad, rad, ocean, ZP);
+		}
 
 		/* grid */
 		drawgrid(cache, r, clat, clon, zoom);
@@ -402,6 +885,7 @@ globedraw(Image *dst, Rectangle r, double clat, double clon, double zoom)
 		cclat = clat;
 		cclon = clon;
 		czoom = zoom;
+		ccoarse = ecoarse;
 		cachevalid = 1;
 	}
 
