@@ -20,6 +20,7 @@ void	earthinit(void);	/* load mask + build shading LUTs; silent no-op if no mask
 void	globecoarse(int c);	/* 1: half-res interactive earth rendering; 0: full quality */
 void	globegeom(Rectangle r, double zoom, int *cx, int *cy, int *rad);
 void	globedraw(Image *dst, Rectangle r, double clat, double clon, double zoom);
+int	globezoomwarp(Image *dst, Rectangle r, double clat, double clon, double zoom);	/* fast affine-scaled zoom preview; 1 if drawn, 0 if caller must globedraw() instead */
 void	geo2screen(Rectangle r, double clat, double clon, double zoom, Geo g, Point *p, int *visible);
 void	geo2vec(Geo g, Vec3 *v);
 void	drawstations(Image *dst, Rectangle r, double clat, double clon, double zoom, Station *s, int ns);

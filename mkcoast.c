@@ -25,18 +25,45 @@
 
 Biobuf *bout;
 
-/* count points in a LineString (array of [lon,lat] arrays) */
+/*
+ * Decode one GeoJSON position ([lon, lat, ...]) into lat/lon.
+ * Returns 0 if it isn't a well-formed pair.
+ */
+static int
+getpoint(JSON *pt, double *lat, double *lon)
+{
+	JSONEl *c;
+
+	if(pt == nil || pt->t != JSONArray)
+		return 0;
+	c = pt->first;
+	if(c == nil || c->val == nil || c->val->t != JSONNumber)
+		return 0;
+	*lon = c->val->n;
+	c = c->next;
+	if(c == nil || c->val == nil || c->val->t != JSONNumber)
+		return 0;
+	*lat = c->val->n;
+	return 1;
+}
+
+/*
+ * count the well-formed points in a LineString, so the "> N"
+ * header always matches the number of lines that follow it
+ */
 static int
 countline(JSON *line)
 {
 	JSONEl *e;
+	double lat, lon;
 	int n;
 
 	if(line == nil || line->t != JSONArray)
 		return 0;
 	n = 0;
 	for(e = line->first; e != nil; e = e->next)
-		n++;
+		if(getpoint(e->val, &lat, &lon))
+			n++;
 	return n;
 }
 
@@ -44,8 +71,7 @@ countline(JSON *line)
 static void
 emitline(JSON *line)
 {
-	JSONEl *e, *c;
-	JSON *pt;
+	JSONEl *e;
 	double lon, lat;
 	int n;
 
@@ -54,20 +80,9 @@ emitline(JSON *line)
 		return;
 
 	Bprint(bout, "> %d\n", n);
-	for(e = line->first; e != nil; e = e->next){
-		pt = e->val;
-		if(pt == nil || pt->t != JSONArray)
-			continue;
-		c = pt->first;
-		if(c == nil || c->val == nil || c->val->t != JSONNumber)
-			continue;
-		lon = c->val->n;
-		c = c->next;
-		if(c == nil || c->val == nil || c->val->t != JSONNumber)
-			continue;
-		lat = c->val->n;
-		Bprint(bout, "%.4f %.4f\n", lat, lon);
-	}
+	for(e = line->first; e != nil; e = e->next)
+		if(getpoint(e->val, &lat, &lon))
+			Bprint(bout, "%.4f %.4f\n", lat, lon);
 	Bprint(bout, "\n");
 }
 

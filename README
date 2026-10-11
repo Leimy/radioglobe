@@ -252,22 +252,30 @@ EARTH MASK
 	is identical to a build with none at all.
 
 AUDIO
-	Playback runs this rc pipeline per station:
+	Each station is played by play(1), run under rc in its own
+	note group so that stopping kills the whole pipeline:
+
+	    play URL </dev/null
+
+	play fetches the URL (hget/webfs), detects the format, and
+	runs the matching decoder (mp3dec/oggdec/aacdec/...).  Every
+	decoder emits 16-bit stereo PCM at 44100 Hz: mp3dec and
+	oggdec by definition (see audio(1)), and aacdec by piping
+	its native rate (often 48000 Hz for AAC) through its own
+	internal pcmconv.  So at the default device rate the decoder
+	output goes straight to /dev/audio.
+
+	If /dev/audio runs at another rate, pass it with -r and
+	radioglobe adds a resampling stage:
 
 	    play -o /fd/1 URL </dev/null | \
 	        audio/pcmconv -o s16c2r<devrate> >/dev/audio
 
-	play(1) fetches the URL (hget/webfs), detects the format,
-	and decodes it (mp3dec/oggdec/aacdec/...), writing raw PCM
-	to stdout instead of opening /dev/audio itself.  pcmconv
-	then resamples that PCM to the device rate before it reaches
-	/dev/audio.
-
-	Why the pcmconv stage: a decoder that emits 48000 Hz (common
-	for AAC) written straight to a 44100 Hz /dev/audio plays back
-	about 9% too fast ("sped up").  Forcing the rate with pcmconv
-	makes decoder and device agree, fixing the pitch/speed.  Set
-	-r to match your device if it is not 44100 Hz.
+	Note that pcmconv here is told only its output format; it
+	assumes 44100 Hz input, which is correct because of the
+	decoder convention above.  It cannot fix a decoder that
+	emits some other rate -- that is the decoder's job, as
+	aacdec does.
 
 	Finding your device rate: the rate is owned by the audio
 	driver and exposed via audio(3).  Read it from /dev/volume:
@@ -278,11 +286,18 @@ AUDIO
 
 		echo speed 48000 >/dev/volume
 
-	in which case run radioglobe -r 48000 so the two agree.
+	in which case run radioglobe -r 48000 so the two agree.  If
+	you play through audio/mixfs, leave -r alone: mixfs expects
+	44100 Hz input and resamples to the device itself.
 
 	For formats not handled by the standard decoders, add a
 	decoder to $path; AAC needs audio/aacdec so play(1) can
 	invoke it for the *aac* case.
+
+	Station files are checked as they load: a line whose latitude
+	is outside [-90, 90] or longitude outside [-180, 180], or
+	whose coordinates are not numbers, is reported with its line
+	number and skipped.
 
 REQUIREMENTS
 	webfs(4) must be mounted for HTTP streaming to work.

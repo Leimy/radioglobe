@@ -83,7 +83,7 @@ static int
 loadfile(char *path)
 {
 	Biobuf *b;
-	char *ln, *f[2];
+	char *ln, *e, *f[2];
 	int cap, np, want, nf;
 	Coastline *c;
 	Geo *pts;
@@ -112,8 +112,15 @@ loadfile(char *path)
 				c->npts = np;
 
 			ln++;
-			want = atoi(ln);
-			if(want < 2){
+			/*
+			 * strtol catches overflow and non-numeric input;
+			 * reject anything that looks malformed or absurdly
+			 * large (a sanity guard, not a hard limit on valid
+			 * data — Natural Earth 50m coastlines can be long).
+			 */
+			ln += strspn(ln, " \t");
+			want = strtol(ln, &e, 10);
+			if(e == ln || want < 2 || want > 10000000){
 				c = nil;
 				pts = nil;
 				np = 0;
@@ -149,6 +156,25 @@ loadfile(char *path)
 		c->npts = np;
 
 	Bterm(b);
+
+	/*
+	 * A block whose header promised N points but delivered fewer
+	 * than 2 parseable ones can't be drawn and would give
+	 * chopcoasts/computevecs a zero-length array and a
+	 * meaningless cap; compact them away here.
+	 */
+	np = 0;
+	for(nf = 0; nf < ncoast; nf++){
+		if(coasts[nf].npts < 2){
+			free(coasts[nf].pts);
+			continue;
+		}
+		coasts[np++] = coasts[nf];
+	}
+	if(np != ncoast)
+		fprint(2, "radioglobe: %s: %d degenerate polyline%s dropped\n",
+			path, ncoast - np, ncoast - np == 1 ? "" : "s");
+	ncoast = np;
 
 	if(ncoast == 0)
 		return -1;

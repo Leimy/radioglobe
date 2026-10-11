@@ -18,15 +18,14 @@
  */
 
 static Image *ocean, *coastcol, *dotcol, *dotsel, *gridcol, *textcol;
-static double dtor;
+
+#define DTOR	(PI / 180.0)
 
 /*
- * Cached static globe layer (ocean + grid + coastlines + border).
- * This is the expensive part to render and it only depends on
- * (r, clat, clon, zoom).  Lots of redraws -- e.g. just updating the
- * hover/selection label, or the status bar -- don't change any of
- * those, so we reuse the cached image instead of re-walking the
- * whole coastline dataset every time.
+ * Cached static globe layer (ocean/earth + grid + coastlines +
+ * border).  It is the expensive part and depends only on
+ * (r, clat, clon, zoom, coarse), so redraws that change none of
+ * those (hover, status bar) just blit it.
  */
 static Image *cache;
 static Rectangle cacherect;
@@ -74,18 +73,13 @@ enum {
 	Natan	= 1024,		/* atan ratio LUT resolution */
 };
 /*
- * rowlut stores *fractional* rows (doubles, the exact
- * (0.5 - asin(z)/PI) * emaskh position, clamped to [0, emaskh-1]),
- * not rounded integers, and both LUTs are read with linear
- * interpolation between adjacent entries (see lutatan2 and
- * drawearth).  With plain quantized reads the LUT step itself
- * becomes visible at deep zoom: 1/Natan rad of longitude is ~250
- * screen pixels at 512x on a ~1000px window, so bilinear texel
- * filtering downstream was being fed column positions that moved
- * in texel-sized stair-steps -- still blocky, just with soft
- * edges.  Interpolated reads make the error second-order (~1e-7
- * rad), far below a texel at any reachable zoom, for one extra
- * multiply-add per lookup.
+ * rowlut holds exact fractional rows ((0.5 - asin(z)/PI) * emaskh,
+ * clamped to [0, emaskh-1]) and both LUTs are read with linear
+ * interpolation between adjacent entries.  This must stay finer
+ * than a texel at max zoom: at 512x, 1/Natan rad of longitude is
+ * ~250 screen pixels, so quantized reads would feed the bilinear
+ * filter stair-stepped coordinates and the blocks would survive
+ * the filtering.  Interpolated reads make the error ~1e-7 rad.
  */
 static double *rowlut;
 static double *atanlut;
@@ -95,16 +89,26 @@ static uchar *ebuf;		/* client-side RGB24 pixel buffer */
 static Image *eimg;
 static Rectangle erect;
 
+static Image*
+color(ulong rgba)
+{
+	Image *i;
+
+	i = allocimage(display, Rect(0,0,1,1), screen->chan, 1, rgba);
+	if(i == nil)
+		sysfatal("allocimage: %r");
+	return i;
+}
+
 void
 globeinit(void)
 {
-	dtor = PI / 180.0;
-	ocean = allocimage(display, Rect(0,0,1,1), screen->chan, 1, 0x0a1a3aff);
-	coastcol = allocimage(display, Rect(0,0,1,1), screen->chan, 1, 0x3a6a4aff);
-	gridcol = allocimage(display, Rect(0,0,1,1), screen->chan, 1, 0x1a2a3aff);
-	dotcol = allocimage(display, Rect(0,0,1,1), screen->chan, 1, 0x44dd88ff);
-	dotsel = allocimage(display, Rect(0,0,1,1), screen->chan, 1, 0xff8844ff);
-	textcol = allocimage(display, Rect(0,0,1,1), screen->chan, 1, DWhite);
+	ocean = color(0x0a1a3aff);
+	coastcol = color(0x3a6a4aff);
+	gridcol = color(0x1a2a3aff);
+	dotcol = color(0x44dd88ff);
+	dotsel = color(0xff8844ff);
+	textcol = color(DWhite);
 }
 
 void
@@ -137,7 +141,7 @@ static int
 loadmask(char *path)
 {
 	Biobuf *b;
-	char *ln, *f[2];
+	char *ln, *e, *f[2];
 	int w, h, istex;
 	long n;
 
@@ -167,9 +171,14 @@ loadmask(char *path)
 		Bterm(b);
 		return -1;
 	}
-	w = atoi(f[0]);
-	h = atoi(f[1]);
-	if(w < 4 || h < 2 || w > 16384 || h > 8192){
+	/* strtol: catch non-numeric input; range check catches overflow */
+	w = strtol(f[0], &e, 10);
+	if(e == f[0] || w <= 0 || w < 4 || w > 16384){
+		Bterm(b);
+		return -1;
+	}
+	h = strtol(f[1], &e, 10);
+	if(e == f[1] || h <= 0 || h < 2 || h > 8192){
 		Bterm(b);
 		return -1;
 	}
@@ -256,14 +265,8 @@ earthinit(void)
 
 /*
  * atan2 via the atan LUT: octant reduction, then an interpolated
- * table lookup on the min/max ratio.  Reading the nearest entry
- * alone quantizes the angle in ~1/Natan rad steps -- harmless when
- * the result was rounded to a texel column anyway (nearest-neighbor
- * sampling), but at 512x zoom one such step spans hundreds of
- * screen pixels and stair-steps the fractional column that bilinear
- * texture filtering needs.  Linear interpolation between adjacent
- * entries cuts the error to second order (~1e-7 rad, far below a
- * texel at any reachable zoom) for one extra multiply-add.
+ * table lookup on the min/max ratio (see the rowlut note above for
+ * why the interpolation is required, not optional).
  */
 static double
 lutatan2(double y, double x)
@@ -327,9 +330,11 @@ drawearth(Image *dst, Rectangle r, double clat, double clon, double zoom)
 			freeimage(eimg);
 		free(ebuf);
 		eimg = allocimage(display, r, RGB24, 0, DNofill);
-		ebuf = malloc((long)w*3*h);
-		if(eimg == nil || ebuf == nil)
+		if(eimg == nil)
 			sysfatal("allocimage: %r");
+		ebuf = malloc((long)w*3*h);
+		if(ebuf == nil)
+			sysfatal("malloc: %r");
 		erect = r;
 	}
 
@@ -403,13 +408,9 @@ drawearth(Image *dst, Rectangle r, double clat, double clon, double zoom)
 			wz = px*ex.z + py*ey.z + pz*ez.z;
 
 			/*
-			 * idxf/colf are the *continuous* (fractional)
-			 * row/col position before any rounding -- kept
-			 * around for etex's bilinear sample below.  The
-			 * plain rounded row/col (used by the emask
-			 * nearest-neighbor path, and as etex's fallback
-			 * if bilinear is ever skipped) are still derived
-			 * the same way as before.
+			 * idxf/colf: continuous (fractional) row/col, for
+			 * etex's bilinear sample; row/col: the truncated
+			 * versions, for the emask nearest-neighbor path.
 			 */
 			idxf = (wz + 1.0) * 0.5 * Nasin;
 			if(idxf < 0)
@@ -440,30 +441,17 @@ drawearth(Image *dst, Rectangle r, double clat, double clon, double zoom)
 
 			if(etex != nil){
 				/*
-				 * Real photo texture (mkearth -i):
-				 * bilinear-filtered sample of the
-				 * stored B,G,R bytes (already in
-				 * RGB24's own byte order, see
-				 * loadmask/mkearth.c).  Nearest-
-				 * neighbor left every mask/texel cell
-				 * a hard-edged block; at high zoom
-				 * (radioglobe's max is 512x) a single
-				 * texel can cover many screen pixels,
-				 * so blending the 4 neighboring texels
-				 * by fractional row/col turns that
-				 * blockiness into a smooth gradient --
-				 * a real resolution increase would only
-				 * push the same problem out further.
-				 *
-				 * fracy interpolates within the row LUT
-				 * itself (between rowlut[idx] and
-				 * rowlut[idx+1], which store exact
-				 * fractional rows) rather than reading
-				 * asin() again, so this stays LUT-cost,
-				 * not trig-cost, per pixel.  Longitude
-				 * wraps (col1 mod emaskw); latitude does
-				 * not (row1 clamps at the last row --
-				 * there's no wraparound over a pole).
+				 * Photo texture: bilinear sample of the
+				 * stored B,G,R bytes (RGB24 byte order).
+				 * At 512x one texel spans many screen
+				 * pixels, so blending 4 neighbours is
+				 * what keeps it smooth; more texture
+				 * resolution would only move the problem.
+				 * The row fraction comes from
+				 * interpolating within rowlut itself, so
+				 * this stays LUT-cost, not trig-cost.
+				 * Longitude wraps; latitude clamps at the
+				 * last row (no wrap over a pole).
 				 */
 				fracy = idxf - idx;
 				rowf = rowlut[idx] + fracy*(rowlut[idx+1] - rowlut[idx]);
@@ -517,12 +505,70 @@ drawearth(Image *dst, Rectangle r, double clat, double clon, double zoom)
 }
 
 /*
+ * Fast zoom preview: if the cached static layer is valid for this
+ * rectangle and view direction and only the zoom differs, scale it
+ * into dst with an affine warp and return 1; return 0 (nothing
+ * drawn) if there is no usable cache, and the caller must do a
+ * real globedraw().
+ *
+ * The scaling is exact, not approximate: globegeom() centers the
+ * disc on the rectangle midpoint at every zoom and zoom is a pure
+ * multiplier on the radius, so two zoom levels of the same view
+ * are uniform scalings of each other about that point.  Rotation
+ * is not affine (limb points move less than center points), which
+ * is why drag/spin use globecoarse() instead.
+ *
+ * This never touches the cache state; the caller must schedule a
+ * real render, which is what re-anchors the cache.  Two guards
+ * keep stale pixels out of the preview: maxwarp bounds how far a
+ * preview may extrapolate from the cache (repeated resampling of
+ * a 1px stroke smears it into a streak), and the destination is
+ * cleared to black first, because affinewarp is SoverD and
+ * samples outside the source are transparent -- zooming out, the
+ * outer ring would otherwise keep the previous frame's pixels.
+ */
+static double maxwarp = 2.0;	/* max preview scale factor away from the cache */
+
+int
+globezoomwarp(Image *dst, Rectangle r, double clat, double clon, double zoom)
+{
+	int cx, cy;
+	double f, m[3][3];
+	Warp w;
+
+	if(!cachevalid || !eqrect(cacherect, r) || clat != cclat || clon != cclon)
+		return 0;
+	if(czoom <= 0)
+		return 0;
+
+	f = zoom / czoom;
+	if(f > maxwarp || f < 1.0/maxwarp)
+		return 0;
+
+	if(f == 1.0){
+		draw(dst, r, cache, nil, r.min);
+		return 1;
+	}
+
+	cx = (r.min.x + r.max.x) / 2;
+	cy = (r.min.y + r.max.y) / 2;
+
+	memset(m, 0, sizeof m);
+	m[0][0] = f;
+	m[1][1] = f;
+	m[2][2] = 1;
+	w = mkwarp(m);
+
+	draw(dst, r, display->black, nil, ZP);
+	genaffinewarp(dst, Pt(cx, cy), r, cache, Pt(cx, cy), nil, ZP, &w, 1);
+	return 1;
+}
+
+/*
  * Screen geometry for a globe drawn in rectangle r at a given zoom:
- * disc center (cx, cy) and radius rad in pixels.  This used to be
- * open-coded in half a dozen places (projection, drawing, hit
- * testing, and the drag handler in main.c), which is exactly how
- * the drag handler ended up disagreeing with the renderer about
- * which rectangle to measure.  One definition, used everywhere.
+ * disc center (cx, cy) and radius rad in pixels.  The single
+ * definition used by projection, drawing, hit testing and the drag
+ * handler; they must never disagree about this.
  */
 void
 globegeom(Rectangle r, double zoom, int *cx, int *cy, int *rad)
@@ -538,18 +584,14 @@ globegeom(Rectangle r, double zoom, int *cx, int *cy, int *rad)
 	*rad = rr;
 }
 
-/*
- * Convert a Geo to a unit vector on the sphere.  Uses PI directly
- * (not the file-scope dtor) because this is called from coast.c
- * during coastinit(), which runs before globeinit() sets dtor.
- */
+/* Convert a Geo to a unit vector on the sphere. */
 void
 geo2vec(Geo g, Vec3 *v)
 {
 	double lat, lon, cl;
 
-	lat = g.lat * PI / 180.0;
-	lon = g.lon * PI / 180.0;
+	lat = g.lat * DTOR;
+	lon = g.lon * DTOR;
 	cl = cos(lat);
 	v->x = cl * cos(lon);
 	v->y = cl * sin(lon);
@@ -577,10 +619,10 @@ project(double clat, double clon, Geo g, double *px, double *py, int *vis)
 	double slat, clat0, slat0, clat1, slon, clon1;
 	double cosc;
 
-	lat = g.lat * dtor;
-	lon = g.lon * dtor;
-	clat0 = clat * dtor;
-	dlon = lon - clon * dtor;
+	lat = g.lat * DTOR;
+	lon = g.lon * DTOR;
+	clat0 = clat * DTOR;
+	dlon = lon - clon * DTOR;
 
 	slat = sin(lat);
 	clat1 = cos(lat);
@@ -728,42 +770,21 @@ drawcoasts(Image *dst, Rectangle r, double clat, double clon, double zoom)
 	for(i = 0; i < ncoast; i++){
 		c = &coasts[i];
 
-		/*
-		 * Quick reject: at any given moment roughly half of
-		 * the planet's coastline is on the far side of the
-		 * globe from the viewer.  Skip the whole polyline --
-		 * without touching a single one of its points -- if
-		 * it cannot possibly have anything visible.  This is
-		 * the difference between "process every coastline
-		 * point on every redraw" and "process only the ones
-		 * that could matter," which is what actually saves
-		 * work as coast.dat grows large.
-		 */
+		/* whole chunk on the far side: skip without touching its points */
 		if(!capvisible(c, &ez))
 			continue;
 
 		/*
-		 * Accumulate runs of consecutive visible points and
-		 * draw each run with a single poly() call instead of
-		 * one line() protocol message per segment. This draws
-		 * exactly the same segments the old per-segment code
-		 * did (a segment only when both its endpoints are
-		 * visible) -- just batched. A polyline with thousands
-		 * of on-screen points used to cost thousands of
-		 * separate draw-device round trips every redraw (even
-		 * after the vector-precompute optimization, which only
-		 * removed the per-point trig, not the per-point draw
-		 * call); now it costs one call per visible run, or a
-		 * handful if a run is longer than Maxpolypts.
-		 */
-		/*
-		 * LOD stride: c->step * rad is the average on-screen
-		 * spacing of consecutive points in pixels.  When it
-		 * falls below a pixel, walking every point buys no
-		 * visible detail -- it only costs projection math and
-		 * raster work -- so step over points to bring the
-		 * drawn spacing back up to about a pixel.  Zoom in
-		 * and the stride falls back to 1 (full detail).
+		 * Runs of consecutive visible points are drawn with one
+		 * poly() call each (a segment exists only when both
+		 * endpoints are visible), not one line() message per
+		 * segment.
+		 *
+		 * LOD stride: c->step * rad is the mean on-screen
+		 * spacing of consecutive points in pixels.  Below a
+		 * pixel, walking every point buys no visible detail, so
+		 * step over points to bring the spacing back to ~1px.
+		 * Zoomed in the stride returns to 1.
 		 */
 		stride = 1;
 		if(c->step > 0 && c->step * rad < 1.0)
@@ -791,14 +812,7 @@ drawcoasts(Image *dst, Rectangle r, double clat, double clon, double zoom)
 			}
 			px = cx + (int)(x * rad);
 			py = cy - (int)(y * rad);
-			/*
-			 * Skip consecutive points that project to the
-			 * same pixel.  Zoomed out, most of a detailed
-			 * dataset collapses onto repeated pixels, and
-			 * every point kept here costs a memline in the
-			 * draw device.  The drawn segments are
-			 * identical minus the zero-length ones.
-			 */
+			/* drop zero-length segments: each kept point costs a memline */
 			if(nrun > 0 && runbuf[nrun-1].x == px && runbuf[nrun-1].y == py)
 				continue;
 			runbuf[nrun].x = px;
@@ -815,37 +829,16 @@ drawcoasts(Image *dst, Rectangle r, double clat, double clon, double zoom)
 	}
 }
 
-/* fill visible land with a simple scanline approach would be expensive.
- * instead, draw filled coastline polygons. we draw all visible coast
- * segments as filled polygons where we have closed regions. for simplicity,
- * just draw the outlines -- filled continents require complex polygon
- * clipping against the globe horizon. the outlines look fine. */
-
 void
 globedraw(Image *dst, Rectangle r, double clat, double clon, double zoom)
 {
 	int cx, cy, rad;
 
-	/*
-	 * Re-render the static layer only when the view actually
-	 * changed.  Plenty of redraws (hover/selection changes,
-	 * status bar updates) leave clat/clon/zoom/r untouched, and
-	 * with a large coast.dat re-walking every point on every one
-	 * of those is the expensive part we don't need to repeat.
-	 */
+	/* re-render the static layer only when the view actually changed */
 	if(!cachevalid || !eqrect(cacherect, r) ||
 	   clat != cclat || clon != cclon || zoom != czoom ||
 	   ecoarse != ccoarse){
-		/*
-		 * Only (re)allocate the offscreen cache image when its
-		 * rectangle actually changes (i.e. a window resize).
-		 * Previously this freed and reallocated the image on
-		 * *every* call that reaches this branch, which includes
-		 * every mouse-motion event during a drag -- pure churn,
-		 * a round trip to the draw device to destroy and rebuild
-		 * an image of the very same size, every single frame.
-		 * Now we just draw fresh content into the same image.
-		 */
+		/* reallocate only on resize; every frame during a drag reaches here */
 		if(cache == nil || !eqrect(cacherect, r)){
 			if(cache != nil)
 				freeimage(cache);
@@ -1101,22 +1094,14 @@ stationhit(Rectangle r, double clat, double clon, double zoom, Point xy,
 	maxd = 12 + dotr;	/* max click distance, pixels */
 
 	/*
-	 * Sticky selection: while the cursor is still on the
-	 * current selection's drawn dot (plus a couple px of
-	 * slack), keep it, even if a neighbor is now nearer.  In
-	 * a dense station file the nearest station changes on
-	 * nearly every pixel of mouse travel, so without
-	 * stickiness the hover label hops between packed
-	 * neighbors; with it, the selection only moves once the
-	 * cursor actually leaves the selected dot.  It also means
-	 * a click always hits the station the label names.
-	 *
-	 * The sticky zone used to be the full grab radius (maxd,
-	 * ~17px), which made dense clusters nearly unselectable:
-	 * every neighbor sat inside the current selection's sticky
-	 * zone, so hover could never move to them without leaving
-	 * the whole neighborhood.  The dot itself is the right
-	 * boundary -- slide off it and nearest-wins resumes.
+	 * Sticky selection: while the cursor is still on the current
+	 * selection's drawn dot (plus 2px), keep it even if a
+	 * neighbor is nearer, so the hover label doesn't hop between
+	 * packed neighbors and a click always hits the station the
+	 * label names.  The boundary must be the dot itself, not the
+	 * grab radius maxd: with maxd, every neighbor in a dense
+	 * cluster sits inside the sticky zone and can never be
+	 * reached.
 	 */
 	if(cursel >= 0 && cursel < ns){
 		vecproject(&ex, &ey, &ez, s[cursel].vec, &x, &y, &cosc);

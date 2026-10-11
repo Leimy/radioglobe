@@ -16,6 +16,10 @@
  * stations are read from a simple text file:
  *   lat lon name url
  * one per line, '#' comments.
+ *
+ * Design history, rejected alternatives and performance
+ * postmortems live in NOTES.md; comments here describe the
+ * current invariants only.
  */
 
 enum {
@@ -55,16 +59,16 @@ int playing = -1;
 int streampid = -1;
 Image *statbg;
 static Image *back;	/* offscreen frame buffer; whole frame is composed here */
-static int dirty;	/* view/selection changed; render on next tick (see Etick) */
+static int dirty;	/* view changed; render on next Etick */
 static int needfine;	/* last render was coarse; render a full-quality settle frame when motion stops */
 static long frametime;	/* previous redraw's cost in ms; shown in the status bar */
 
 /*
- * Output sample rate for the audio device, in Hz.  The standard
- * decoders emit 44100; many AAC streams are natively 48000.  We
- * pass everything through audio/pcmconv to the device rate so a
- * decoder/device rate mismatch can't make playback sound sped up
- * or slowed down.  Override with -r if /dev/audio runs at 48000.
+ * Sample rate of /dev/audio, in Hz.  Every decoder play(1) runs
+ * emits s16c2r44100 (mp3dec/oggdec by definition, aacdec via its
+ * own internal pcmconv), so at the default rate the decoder output
+ * goes straight to the device; at any other rate (-r) an extra
+ * pcmconv stage resamples 44100 -> devrate.
  */
 int devrate = 44100;
 
@@ -82,39 +86,34 @@ static void
 startstream(int idx)
 {
 	int pid;
-	char *qurl;
-	char cmd[4096];
+	char *qurl, *cmd;
 
 	stopstream();
 	if(idx < 0 || idx >= nstation)
 		return;
 
 	/*
-	 * Build an rc pipeline:
+	 * play(1) fetches the URL (hget/webfs), sniffs the format
+	 * and runs the matching decoder.  See devrate above for why
+	 * the pcmconv stage exists only when the device isn't 44100.
 	 *
-	 *   play -o /fd/1 URL </dev/null | audio/pcmconv -o s16c2rRATE >/dev/audio
-	 *
-	 * play(1) still does URL fetch (hget/webfs), format detection,
-	 * and decoding (mp3dec/oggdec/aacdec/...), but with -o /fd/1 it
-	 * writes raw PCM to stdout instead of opening /dev/audio itself.
-	 * pcmconv then resamples that PCM to the device rate before it
-	 * reaches /dev/audio.  This is what fixes "sped up" playback:
-	 * a decoder emitting 48000Hz into a 44100Hz device plays ~9%
-	 * fast; pcmconv converts the rate so it always matches.
-	 *
-	 * RFCFDG: child has independent, clean file descriptor table
-	 * RFNOTEG: new note group so postnote(PNGROUP) kills the whole
-	 *   pipeline (play, hget, decoder, pcmconv).
-	 * RFNOWAIT: don't block the parent.
+	 * RFCFDG: fresh fd table; 0/1/2 are set up below.
+	 * RFNOTEG: new note group, so postnote(PNGROUP) in
+	 *   stopstream() kills the whole pipeline -- rc, play, hget,
+	 *   the decoder and pcmconv -- in one shot.
+	 * RFNOWAIT: no zombie to reap.
 	 */
 	qurl = quotestrdup(stations[idx].url);
 	if(qurl == nil)
 		sysfatal("quotestrdup: %r");
-	snprint(cmd, sizeof cmd,
-		"play -o /fd/1 %s </dev/null | "
-		"audio/pcmconv -o s16c2r%d >/dev/audio",
-		qurl, devrate);
+	if(devrate == 44100)
+		cmd = smprint("play %s </dev/null", qurl);
+	else
+		cmd = smprint("play -o /fd/1 %s </dev/null | "
+			"audio/pcmconv -o s16c2r%d >/dev/audio", qurl, devrate);
 	free(qurl);
+	if(cmd == nil)
+		sysfatal("smprint: %r");
 
 	pid = rfork(RFPROC|RFCFDG|RFNOTEG|RFNOWAIT);
 	if(pid == 0){
@@ -131,6 +130,7 @@ startstream(int idx)
 		execl("/bin/rc", "rc", "-c", cmd, nil);
 		exits("exec");
 	}
+	free(cmd);
 	if(pid > 0){
 		streampid = pid;
 		playing = idx;
@@ -161,12 +161,36 @@ skipws(char *s)
 	return s + strspn(s, " \t");
 }
 
+/*
+ * Parse a decimal number occupying the whole of s and lying in
+ * [lo, hi].  atof() would turn garbage into 0 and accept a
+ * latitude of 400, which trigonometric periodicity then folds
+ * onto a plausible but wrong spot on the sphere.
+ */
+static int
+parsecoord(char *s, double lo, double hi, double *v)
+{
+	char *e;
+
+	*v = strtod(s, &e);
+	if(e == s || *e != 0)
+		return -1;
+	if(isNaN(*v))
+		return -1;
+	if(isInf(*v, 0))
+		return -1;
+	if(*v < lo || *v > hi)
+		return -1;
+	return 0;
+}
+
 static int
 loadstations(char *path)
 {
-	int fd, n, cap, len;
+	int fd, n, cap, len, lineno, nbad;
 	char *buf, *s, *e, *slat, *slon, *name, *url;
 	char *last, *t, *u, *v;
+	double lat, lon;
 	long sz;
 	Dir *d;
 
@@ -204,8 +228,11 @@ loadstations(char *path)
 	stations = nil;
 	nstation = 0;
 	cap = 0;
+	lineno = 0;
+	nbad = 0;
 
 	for(s = buf; s && *s; s = e){
+		lineno++;
 		e = strchr(s, '\n');
 		if(e)
 			*e++ = 0;
@@ -252,8 +279,10 @@ loadstations(char *path)
 					}
 				}
 			}
-			if(last == nil)
+			if(last == nil){
+				nbad++;
 				continue;
+			}
 			*last = 0;
 			url = skipws(last + 1);
 		}
@@ -263,8 +292,17 @@ loadstations(char *path)
 		while(len > 0 && (url[len-1] == ' ' || url[len-1] == '\t'
 			|| url[len-1] == '\r'))
 			url[--len] = 0;
-		if(!url[0])
+		if(!url[0]){
+			nbad++;
 			continue;
+		}
+
+		if(parsecoord(slat, -90.0, 90.0, &lat) < 0 ||
+		   parsecoord(slon, -180.0, 180.0, &lon) < 0){
+			fprint(2, "%s:%d: bad coordinates, line skipped\n", path, lineno);
+			nbad++;
+			continue;
+		}
 
 		if(nstation >= cap){
 			cap = cap ? cap * 2 : 64;
@@ -272,8 +310,8 @@ loadstations(char *path)
 			if(stations == nil)
 				sysfatal("realloc: %r");
 		}
-		stations[nstation].geo.lat = atof(slat);
-		stations[nstation].geo.lon = atof(slon);
+		stations[nstation].geo.lat = lat;
+		stations[nstation].geo.lon = lon;
 		geo2vec(stations[nstation].geo, &stations[nstation].vec);
 		stations[nstation].name = strdup(name);
 		stations[nstation].url = strdup(url);
@@ -282,6 +320,8 @@ loadstations(char *path)
 		nstation++;
 	}
 	free(buf);
+	if(nbad > 0)
+		fprint(2, "%s: %d malformed line%s skipped\n", path, nbad, nbad == 1 ? "" : "s");
 	return nstation;
 }
 
@@ -318,12 +358,10 @@ drawstatusbar(Image *dst)
 			orb.pitch, orb.yaw, orb.zoom, frametime);
 
 	/*
-	 * On the light path (dst == screen) erase only as far as
-	 * the text reaches -- and as far as the previous text
-	 * reached -- instead of rewriting the full window-width
-	 * strip on every hover change; it's the biggest write that
-	 * path makes.  Full recomposes (dst == back) still paint
-	 * the whole strip, so back never accumulates stale tails.
+	 * Light path (dst == screen): erase only as far as the new
+	 * and the previous text reached, not the whole strip.  Full
+	 * recomposes (dst == back) paint the whole strip, so back
+	 * never accumulates stale tails.
 	 */
 	w = stringwidth(font, buf) + 12;
 	if(dst == screen){
@@ -331,7 +369,6 @@ drawstatusbar(Image *dst)
 			lastw = w;
 		if(r.min.x + lastw < r.max.x)
 			r.max.x = r.min.x + lastw;
-		lastw = w;
 	}else
 		lastw = w;
 
@@ -342,6 +379,14 @@ drawstatusbar(Image *dst)
 
 static Rectangle selrect;	/* screen pixels covered by the selection overlay */
 
+/*
+ * Full frame: compose globe + stations + status bar offscreen in
+ * back, blit once (drawing straight to screen flickers when the
+ * draw command buffer auto-flushes mid-frame), then paint the
+ * selection overlay on the screen only.  Invariant: back never
+ * contains overlay pixels, so redrawsel() can erase an old overlay
+ * by restoring from it.
+ */
 static void
 redraw(void)
 {
@@ -350,14 +395,6 @@ redraw(void)
 
 	t0 = nsec();
 
-	/*
-	 * Compose the whole frame offscreen, then blit it to the
-	 * window in one draw.  Drawing straight to screen flickers
-	 * at large station counts: libdraw's command buffer fills
-	 * up mid-frame and each auto-flush exposes a half-drawn
-	 * frame.  back shares screen's coordinate system, so all
-	 * screen->r-based geometry stays valid.
-	 */
 	if(back == nil || !eqrect(back->r, screen->r)){
 		freeimage(back);
 		back = allocimage(display, screen->r, screen->chan, 0, DNofill);
@@ -370,12 +407,6 @@ redraw(void)
 	drawstations(back, gr, orb.pitch, orb.yaw, orb.zoom, stations, nstation);
 	drawstatusbar(back);
 	draw(screen, screen->r, back, nil, screen->r.min);
-	/*
-	 * The selection overlay goes to the screen only, after the
-	 * blit, so back always holds the selection-free base frame:
-	 * redrawsel() erases an old overlay by restoring its pixels
-	 * from back, which must not itself contain overlay pixels.
-	 */
 	selrect = drawsel(screen, gr, orb.pitch, orb.yaw, orb.zoom,
 		stations, nstation, selstation);
 	flushimage(display, 1);
@@ -383,13 +414,10 @@ redraw(void)
 }
 
 /*
- * Selection-only update: the view didn't change, so the base
- * frame in back is still exact.  Erase the old overlay by
- * restoring its pixels from back, draw the new overlay and the
- * status bar, and leave every other pixel on screen untouched.
- * Hovering across stations costs a couple of dot-sized writes
- * instead of a full-window recompose that repainted every dot
- * on screen to change one of them.
+ * Selection-only update: the view is unchanged, so back is still
+ * exact.  Restore the old overlay's pixels from back, draw the new
+ * overlay and the status bar; no other screen pixel is written.
+ * Only valid when no view redraw is pending (see the hover code).
  */
 static void
 redrawsel(void)
@@ -403,6 +431,38 @@ redrawsel(void)
 	selrect = drawsel(screen, globerect(), orb.pitch, orb.yaw, orb.zoom,
 		stations, nstation, selstation);
 	drawstatusbar(screen);
+	flushimage(display, 1);
+}
+
+/*
+ * Instant preview for a zoom-only change: affine-scale the cached
+ * static layer (globezoomwarp) instead of re-rendering it, then
+ * composite the cheap layers on top.  Always marks the view dirty
+ * so the next Etick does a real render; that real render is what
+ * re-anchors the cache, so successive previews never compound
+ * their resampling error.  If no preview is possible (no cache,
+ * view rotated, zoom drifted too far) draw nothing and leave it to
+ * the tick: an input handler must never pay for a per-pixel
+ * render.  Rejected alternatives: NOTES.md.
+ */
+static void
+zoomredraw(void)
+{
+	Rectangle gr;
+
+	dirty = 1;
+	if(back == nil || !eqrect(back->r, screen->r))
+		return;
+
+	gr = globerect();
+	if(!globezoomwarp(back, gr, orb.pitch, orb.yaw, orb.zoom))
+		return;
+
+	drawstations(back, gr, orb.pitch, orb.yaw, orb.zoom, stations, nstation);
+	drawstatusbar(back);
+	draw(screen, screen->r, back, nil, screen->r.min);
+	selrect = drawsel(screen, gr, orb.pitch, orb.yaw, orb.zoom,
+		stations, nstation, selstation);
 	flushimage(display, 1);
 }
 
@@ -470,35 +530,26 @@ main(int argc, char **argv)
 	globeinit();
 
 	statbg = allocimage(display, Rect(0,0,1,1), screen->chan, 1, 0x141414ff);
+	if(statbg == nil)
+		sysfatal("allocimage: %r");
 
 	if(loadstations(stationfile) < 0)
 		fprint(2, "warning: could not load %s: %r\n", stationfile);
 
 	orbitinit(&orb, 0.0, 30.0, 1.0);
 	/*
-	 * Drive the spin off real elapsed time, not tick count: with
-	 * frictionref set, orbittick subdivides whatever ms we hand
-	 * it into Tickms-sized steps (see view.h), so a late tick
-	 * applies exactly the motion its elapsed time deserves.
-	 * Without this the trajectory depended on how many ticks we
-	 * managed to service -- with the per-pixel earth render a
-	 * frame can outlast the tick interval, so the spin advanced
-	 * slower than real time and decayed over a longer wall-clock
-	 * period than the flick implied: visibly "not keeping up."
+	 * frictionref makes orbittick() integrate real elapsed time
+	 * in Tickms-sized steps, so the spin's trajectory is
+	 * wall-clock, not tick-count (see view.h and the Etick case).
+	 * zoommax 512 is what it takes to separate same-city station
+	 * clusters; stationhit() box-rejects before squaring so the
+	 * pixel radii involved can't overflow int.
 	 */
 	orb.frictionref = Tickms;
 	orb.zoommin = 0.5;
-	/*
-	 * 512x resolves same-city station clusters that 128x left
-	 * merged: at 128x on a ~1000px window a degree is ~1100px,
-	 * so stations a few hundred meters apart still landed
-	 * within one dot.  Safe now that stationhit() box-rejects
-	 * before squaring pixel distances (at these radii the
-	 * squares overflowed int).
-	 */
 	orb.zoommax = 512.0;
 	oldbuttons = 0;
-	lasttick = nsec();	/* baseline for the Etick elapsed-time measurement */
+	lasttick = nsec();
 
 	redraw();
 
@@ -510,20 +561,19 @@ main(int argc, char **argv)
 			m = ev.mouse;
 
 			/*
-			 * scroll wheel zoom; keep oldbuttons up to date
-			 * even on this early exit, so a chorded
-			 * scroll+button event can't retrigger the
-			 * button edge detection below on the next event.
+			 * scroll wheel zoom; keep oldbuttons current on
+			 * this early exit so a chorded scroll+button
+			 * event can't retrigger the edge detection below.
 			 */
 			if(m.buttons & 8){
 				orbitzoom(&orb, 1.15);
-				redraw();
+				zoomredraw();
 				oldbuttons = m.buttons;
 				break;
 			}
 			if(m.buttons & 16){
 				orbitzoom(&orb, 1.0/1.15);
-				redraw();
+				zoomredraw();
 				oldbuttons = m.buttons;
 				break;
 			}
@@ -535,20 +585,12 @@ main(int argc, char **argv)
 					orbitdown(&orb, m.xy.x, m.xy.y, m.msec);
 				} else {
 					/*
-					 * motion while held: compute the same
-					 * radius the renderer uses so drag
-					 * tracks the cursor exactly 1:1.
-					 *
-					 * Don't redraw here: at large dataset
-					 * scale a redraw outlasts the interval
-					 * between mouse events, so redrawing
-					 * per event backlogs the queue and
-					 * renders a parade of stale positions.
-					 * Just update the orbit (cheap; every
-					 * sample still feeds the velocity
-					 * tracker, so flick momentum is
-					 * unaffected) and let the next Etick
-					 * render the latest position once.
+					 * Motion while held: same radius as the
+					 * renderer, so drag tracks 1:1.  No
+					 * redraw here -- only update the orbit
+					 * and mark dirty; the Etick renders the
+					 * latest position once per tick, so a
+					 * slow frame can't backlog the queue.
 					 */
 					globegeom(globerect(), orb.zoom, &cx, &cy, &rad);
 					orbitmove(&orb, m.xy.x, m.xy.y, m.msec,
@@ -556,20 +598,15 @@ main(int argc, char **argv)
 					dirty = 1;
 				}
 			} else {
-				if(orb.dragging){
-					/*
-					 * No button 1: end any drag, keeping
-					 * the launch velocity.  Deliberately
-					 * not an oldbuttons edge test -- the
-					 * scroll branches above break early
-					 * and overwrite oldbuttons, so a
-					 * release during a scroll chord would
-					 * lose the edge and leave the drag
-					 * stuck on.
-					 */
+				/*
+				 * No button 1: end any drag, keeping the
+				 * launch velocity.  Not an oldbuttons edge
+				 * test: the scroll branches above overwrite
+				 * oldbuttons, so a release during a scroll
+				 * chord would lose the edge.
+				 */
+				if(orb.dragging)
 					orbitup(&orb);
-					/* any pending final position renders on the next tick */
-				}
 			}
 
 			/* middle button: select station */
@@ -598,10 +635,12 @@ main(int argc, char **argv)
 					 * indices into stations[] are meaningless
 					 * across a reload; stopping the stream is
 					 * less surprising than a status bar that
-					 * names the wrong station.
+					 * names the wrong station.  On failure
+					 * loadstations() leaves the old list.
 					 */
 					stopstream();
-					loadstations(stationfile);
+					if(loadstations(stationfile) < 0)
+						fprint(2, "reload: could not load %s: %r\n", stationfile);
 					selstation = -1;
 					break;
 				case Mexit:
@@ -612,25 +651,16 @@ main(int argc, char **argv)
 			}
 
 			/*
-			 * hover: find nearest station.  A selection
-			 * change doesn't touch the view, so it takes
-			 * the light path: restore + overlay + status
-			 * bar, a few tiny writes.  Cheap enough to do
-			 * per event, and no other pixel on screen is
-			 * written at all.
+			 * Hover.  A selection change doesn't touch the
+			 * view, so it takes the light path -- unless a
+			 * view redraw is already pending, in which case
+			 * back lags the orbit and the queued full redraw
+			 * will show the new selection anyway.
 			 */
 			if(m.buttons == 0 && !orb.dragging){
 				int s = findstation(m.xy);
 				if(s != selstation){
 					selstation = s;
-					/*
-					 * If a view change is already pending
-					 * (momentum tick advanced the orbit
-					 * but its redraw hasn't run yet),
-					 * back and the screen lag the orbit
-					 * state; the queued full redraw will
-					 * include the new selection anyway.
-					 */
 					if(!dirty)
 						redrawsel();
 				}
@@ -679,16 +709,19 @@ main(int argc, char **argv)
 			case '+':
 			case '=':
 				orbitzoom(&orb, 1.3);
-				redraw();
+				zoomredraw();
 				break;
 			case '-':
 				orbitzoom(&orb, 1.0/1.3);
-				redraw();
+				zoomredraw();
 				break;
 			case '0':
+				/* reset view; also stop any spin, or it would carry on from the reset position */
 				orb.zoom = 1.0;
 				orb.pitch = 30.0;
 				orb.yaw = 0.0;
+				orb.vyaw = 0.0;
+				orb.vpitch = 0.0;
 				orbitnorm(&orb);
 				redraw();
 				break;
@@ -697,92 +730,49 @@ main(int argc, char **argv)
 
 		case Etick:
 			/*
-			 * Advance the spin by the time that actually
-			 * elapsed since the previous tick, not by a
-			 * nominal Tickms: ticks run late whenever a
-			 * frame outlasts the tick interval, and
-			 * charging each one a flat 25ms made the
-			 * animation lag real time and overstay its
-			 * decay.  orb.frictionref (set above) makes
-			 * orbittick subdivide this correctly.
+			 * Advance the spin by real elapsed time, not a
+			 * nominal Tickms: ticks run late whenever a frame
+			 * outlasts the interval, and orb.frictionref makes
+			 * orbittick() subdivide a long interval correctly.
+			 * Guards: a non-positive delta (a negative nsec()
+			 * reading has been observed for real; NOTES.md)
+			 * falls back to one nominal tick, and a long stall
+			 * (hidden window, busy machine) is capped so the
+			 * globe resumes rather than teleports.
 			 */
 			now = nsec();
 			dtms = (now - lasttick) / 1000000.0;
 			lasttick = now;
-			/*
-			 * Guards: a bogus clock reading shouldn't
-			 * teleport the globe (NOTES.md records a real
-			 * observed nsec() anomaly -- one reading ~23s
-			 * negative -- during the globebench work), and
-			 * neither should a genuine long stall (window
-			 * hidden, machine busy).  Fall back to one
-			 * nominal tick, and cap the catch-up.
-			 */
 			if(dtms <= 0.0)
 				dtms = Tickms;
 			if(dtms > 250.0)
 				dtms = 250.0;
-			/*
-			 * Physics first, unconditionally: it is a
-			 * handful of multiplies, and skipping it (as
-			 * the old ecankbd() early-out below did, by
-			 * breaking before this point) silently dropped
-			 * that interval's motion.  Only the expensive
-			 * part -- redraw -- is worth skipping.
-			 */
+
+			/* physics always runs; only the redraw is skippable */
 			if(orbittick(&orb, dtms))
 				dirty = 1;
+
 			/*
-			 * If a keystroke (e.g. quit) is already
-			 * waiting, skip this tick's redraw and let
-			 * the loop go straight back to event() to
-			 * handle it. redraw() runs synchronously and
-			 * isn't free at large dataset scale; without
-			 * this check a fast spin can keep retriggering
-			 * redraws back-to-back and a pending keypress
-			 * can keep "just missing its turn" until the
-			 * spin fully decays. event(2) already
-			 * prioritizes keyboard over the timer when
-			 * both are ready -- this just avoids doing
-			 * more (possibly slow) work before giving it
-			 * the chance to.
+			 * Skip this tick's redraw if a keystroke is
+			 * waiting (so 'q' isn't starved by a fast spin
+			 * whose frames outlast the tick) or another tick
+			 * is already queued (one redraw for the whole
+			 * backlog, with fully advanced state).
 			 */
-			if(ecankbd())
+			if(ecankbd() || ecanread(Etick))
 				break;
+
 			/*
-			 * Ticks pile up behind a slow redraw.  This
-			 * tick's physics is applied above, but if
-			 * another tick is already queued, let it do
-			 * the drawing: one redraw for the whole
-			 * backlog, with fully advanced state, instead
-			 * of a back-to-back burst of stale frames.
-			 */
-			if(ecanread(Etick))
-				break;
-			/*
-			 * All view-changing redraws -- drag motion and
-			 * momentum spin -- funnel through the dirty
-			 * flag: mouse events just mark the view stale,
-			 * and we render the latest state here, once per
-			 * tick.  Redraw rate is bounded at the tick
-			 * rate, the event queue can't back up behind
-			 * slow redraws, and every frame shows current
-			 * state instead of a queued stale one.
-			 * (Selection-only changes bypass this entirely
-			 * via redrawsel(), which is cheap enough to run
-			 * per event.)
-			 *
-			 * With a solid earth loaded, motion frames
-			 * render at half resolution (globecoarse; the
-			 * per-pixel earth pass is the dominant frame
-			 * cost and can outlast the tick interval at
-			 * full window size, which is what made drag/
-			 * spin stutter and input go erratic behind the
-			 * backlogged frames).  When a tick finds no
-			 * motion left, one full-quality settle frame
-			 * re-renders the final view; discrete actions
-			 * (zoom, keyboard, menu) never set coarse and
-			 * so stay full quality.
+			 * Every view-changing redraw -- drag, spin, zoom
+			 * -- funnels through dirty and renders here, at
+			 * most once per tick, so the event queue can never
+			 * back up behind slow frames.  Motion frames render
+			 * coarse (half-res earth); when motion stops, one
+			 * full-quality settle frame follows.  Zoom lands
+			 * here too even though zoomredraw() already showed
+			 * a preview: this real render is what re-anchors
+			 * the warp cache.  Selection-only changes bypass
+			 * all of this via redrawsel().
 			 */
 			if(dirty){
 				dirty = 0;
