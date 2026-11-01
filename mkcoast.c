@@ -5,30 +5,16 @@
 #include "util.h"
 
 /*
- * mkcoast - convert a Natural Earth coastline GeoJSON file
- * into radioglobe's coast.dat format.
+ * mkcoast - convert Natural Earth GeoJSON coastline to coast.dat.
  *
- *	mkcoast < ne_110m_coastline.geojson > coast.dat
- *
- * GeoJSON coastline is a FeatureCollection.  Each feature has
- * a geometry of type LineString (an array of [lon,lat] points)
- * or MultiLineString (an array of LineStrings).  Note the
- * coordinate order is [longitude, latitude] -- the reverse of
- * our internal Geo{lat,lon}.
- *
- * Output: one polyline per block:
- *	> N
- *	lat lon
- *	... (N lines)
- * Blank line between blocks.  Comments start with #.
+ * GeoJSON FeatureCollection: LineString or MultiLineString features.
+ * GeoJSON uses [lon, lat]; output is lat,lon.
+ * Output: "> N" header, N "lat lon" lines per polyline, blank-separated.
  */
 
 Biobuf *bout;
 
-/*
- * Decode one GeoJSON position ([lon, lat, ...]) into lat/lon.
- * Returns 0 if it isn't a well-formed pair.
- */
+/* Decode GeoJSON position [lon, lat, ...] into lat/lon. */
 static int
 getpoint(JSON *pt, double *lat, double *lon)
 {

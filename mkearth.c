@@ -5,65 +5,17 @@
 #include <memdraw.h>
 
 /*
- * mkearth - bake an equirectangular earth texture for radioglobe
+ * mkearth - bake an equirectangular earth texture for radioglobe.
  *
- * Two independent modes, both writing to standard output a file
- * radioglobe loads via -e (or ./earth.mask, or /lib/radio/earth.mask)
- * to draw a shaded solid globe instead of the flat ocean disc:
+ * Two modes:
+ * 1. Default: rasterize coast.dat into a land/ocean mask.
+ *    Flood-fill ocean from known open-ocean seeds; unreachable = land.
+ *    Output: EARTHMASK / w h / <w*h bytes: 1=land, 0=ocean>
+ * 2. -i imagefile: convert a Plan 9 image(6) to an RGB texture.
+ *    No resampling; source resolution is the output resolution.
+ *    Output: EARTHTEX / w h / <w*h*3 bytes: B,G,R>
  *
- * 1. Default mode: reads coast.dat (mkcoast output: "> N" then N
- *    "lat lon" lines per polyline) on standard input, rasterizes
- *    every coastline segment into a w x w/2 pixel grid (x =
- *    longitude -180..180, y = latitude 90..-90, row 0 = north
- *    pole), flood-fills OCEAN from a handful of known open-ocean
- *    seed points (4-connected, wrapping in longitude), and writes:
- *
- *	EARTHMASK
- *	w h
- *	<w*h raw bytes, row-major from the north pole: 1=land 0=ocean>
- *
- *    The fill is topological, not geometric: anything the ocean
- *    flood cannot reach is land.  Boundary pixels (the rasterized
- *    coastlines themselves) count as land.  Consequences, all
- *    acceptable for a shading mask (the coastline overlay still
- *    draws exact outlines):
- *     - closed seas whose ring is in the data (e.g. the Caspian)
- *       come out as land;
- *     - Antarctica needs no special casing: the flood stops at its
- *       coastline and everything south of it stays land;
- *     - an UNCLOSED coastline ring in the data would let the flood
- *       leak into that landmass and mark it ocean.  The land
- *       percentage printed at the end is the tell: Earth is ~30%
- *       land by equirectangular pixel count; a dramatically lower
- *       number means a leak (use -t and look at the picture).
- *
- * 2. -i imagefile mode: converts an equirectangular photo/texture
- *    (e.g. NASA Blue Marble) instead of building a land/ocean mask
- *    from coast.dat.  imagefile must be an UNCOMPRESSED Plan 9
- *    image(6) file -- produce one from a JPEG/PNG/TIFF with, e.g.:
- *	jpg -9 -t earth.jpg > earth.plan9img
- *	mkearth -i earth.plan9img > earth.mask
- *    (-9: uncompressed image(6) output; -t: force true-color RGB.
- *    tif/png read the corresponding formats the same way.)  Writes:
- *
- *	EARTHTEX
- *	w h
- *	<w*h*3 raw bytes, row-major from the image's own row 0 (which
- *	 must be the north pole, as in any standard equirectangular
- *	 world map): B,G,R per pixel, matching Image channel RGB24>
- *
- *    w/h are taken directly from the source image -- no resampling
- *    is done, so whatever resolution you feed in is what radioglobe
- *    samples from.  In this mode coast.dat/stdin is not read at all.
- *
- * In both modes, radioglobe draws the vector coastline outline and
- * lat/lon grid from coast.dat on top of whichever earth is loaded,
- * so the visible outline stays exact either way; the mask/texture
- * only supplies the shaded fill underneath it.
- *
- * usage:
- *	mkearth [-w width] [-t preview.tga] < coast.dat > earth.mask
- *	mkearth -i imagefile > earth.mask
+ * In both modes, vector coastlines and grid are drawn on top by radioglobe.
  */
 
 enum {
@@ -89,13 +41,7 @@ plot(int x, int y)
 	grid[y*W + x] = Bound;
 }
 
-/*
- * Rasterize one segment as a straight line in equirectangular
- * pixel space (fine at coastline-segment scale).  DDA stepped at
- * >= one step per pixel in the dominant axis, so the drawn line
- * is 8-connected and the 4-connected ocean flood cannot leak
- * through it diagonally.
- */
+/* Rasterize one segment as a line in equirectangular space (DDA). */
 static void
 seg(double lat1, double lon1, double lat2, double lon2)
 {
@@ -121,12 +67,7 @@ seg(double lat1, double lon1, double lat2, double lon2)
 		plot((int)(x1 + dx*i/n), (int)(y1 + dy*i/n));
 }
 
-/*
- * 4-connected BFS from open-ocean seeds, wrapping in longitude.
- * Several seeds, not one: at coarse widths a rasterized coastline
- * can pinch a strait shut (e.g. Bering) and split an ocean into
- * regions the other seeds still cover.
- */
+/* 4-connected BFS from open-ocean seeds, wrapping in longitude. */
 static void
 flood(void)
 {
@@ -173,7 +114,7 @@ flood(void)
 	free(q);
 }
 
-/* minimal uncompressed 24-bit TGA, top-left origin, for eyeballing */
+/* Minimal uncompressed 24-bit TGA preview (top-left origin). */
 static void
 writepreview(char *path)
 {
@@ -215,15 +156,7 @@ writepreview(char *path)
 	close(fd);
 }
 
-/*
- * Convert an uncompressed Plan 9 image file (imagefile) into an
- * EARTHTEX texture on standard output, and exit -- coast.dat/stdin
- * is not touched in this mode.  No resampling: output dimensions are
- * exactly the source image's.  memimagedraw() into a fresh RGB24
- * Memimage does whatever channel conversion is needed (e.g. a
- * greyscale or paletted source), so this works regardless of the
- * source's original chan, not just already-RGB24 input.
- */
+/* Convert uncompressed Plan 9 image(6) to EARTHTEX on stdout. No resampling. */
 static void
 mktexture(char *imagefile)
 {

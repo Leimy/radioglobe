@@ -5,37 +5,21 @@
 #include "util.h"
 
 /*
- * mkstations - convert radio-browser.info JSON into
- * radioglobe's station-file format.
+ * mkstations - convert radio-browser.info JSON to radioglobe station format.
  *
  *	mkstations [-a] [-b minbitrate] < stations.json > stations
  *
- * Fetch the input with (no network in the agent, run yourself):
- *   hget 'https://de1.api.radio-browser.info/json/stations/search?\
- *     limit=1000&has_geo_info=true&hidebroken=true&\
- *     order=clickcount&reverse=true' > /tmp/stations.json
- *
- * The response is a JSON array of objects.  We use:
- *	name		station name
- *	url_resolved	stream url (preferred); falls back to url
- *	geo_lat		latitude
- *	geo_long	longitude (note: "geo_long", not "geo_lon")
- *	codec		MP3 / OGG / AAC / ...
- *	bitrate		kbps (number)
- *
- * By default MP3, OGG/Vorbis, and AAC/AAC+ are emitted (an
- * aacdec must be installed for AAC).  HLS (.m3u8) playlists are
- * still skipped since the decoders cannot demux them.  -a keeps
- * every codec and HLS.  -b sets a minimum bitrate.
- *
- * Output line format:  lat lon "name" url
+ * Input: JSON array of station objects.  Fields used:
+ *	name, url_resolved (fallback: url), geo_lat, geo_long, codec, bitrate, hls.
+ * Default: emit MP3/OGG/AAC; skip HLS (.m3u8).  -a keeps all.  -b sets min bitrate.
+ * Output: lat lon "name" url (one per line).
  */
 
 Biobuf *bout;
 int keepall;
 int minbitrate;
 
-/* json value -> number, with default if missing/not a number */
+/* JSON value -> number, with default if missing/not a number. */
 static double
 numof(JSON *o, char *key, double def)
 {
@@ -52,7 +36,7 @@ numof(JSON *o, char *key, double def)
 	return def;
 }
 
-/* json value -> string, or nil */
+/* JSON value -> string, or nil. */
 static char *
 strof(JSON *o, char *key)
 {
@@ -64,10 +48,7 @@ strof(JSON *o, char *key)
 	return jsonstr(v);
 }
 
-/*
- * write a name into a quoted field, sanitizing: collapse
- * whitespace, drop control chars and embedded double quotes.
- */
+/* Emit name in quoted field, collapsing whitespace, dropping control chars and quotes. */
 static void
 emitname(char *s)
 {

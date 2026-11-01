@@ -7,21 +7,14 @@
 #include "dat.h"
 
 /*
- * radioglobe - an internet radio globe for 9front
+ * radioglobe - an interactive orthographic globe with radio station dots.
  *
- * presents an interactive orthographic globe projection
- * with radio station dots. click a station to stream it.
- * drag to rotate the globe. scroll to zoom.
+ * Drag to rotate, scroll to zoom, click a station to stream it.
+ * Stations: lat lon name url (one per line, '#' comments).
  *
- * stations are read from a simple text file:
- *   lat lon name url
- * one per line, '#' comments.
- *
- * Design history, rejected alternatives and performance
- * postmortems live in NOTES.md; comments here describe the
- * current invariants only.
+ * Etick is a timer event key for momentum/inertial spin.
+ * Emouse==1 and Ekeyboard==2 are taken by event(2); Etick uses 4.
  */
-
 enum {
 	Mplay,
 	Mstop,
@@ -29,15 +22,9 @@ enum {
 	Mexit,
 };
 
-/*
- * Etick: timer event key for momentum/inertial spin.  Emouse==1 and
- * Ekeyboard==2 are already taken by event(2); 4 is the next power
- * of two and isn't used elsewhere, so we can request it explicitly
- * from etimer() and still switch on it as a compile-time constant.
- */
 enum {
 	Etick = 4,
-	Tickms = 25,		/* ~40Hz */
+	Tickms = 25,		/* timer interval (~40Hz) */
 };
 
 char *menuitems[] = {
@@ -58,17 +45,13 @@ int selstation = -1;
 int playing = -1;
 int streampid = -1;
 Image *statbg;
-static Image *back;	/* offscreen frame buffer; whole frame is composed here */
+static Image *back;	/* offscreen frame buffer */
 static int dirty;	/* view changed; render on next Etick */
-static int needfine;	/* last render was coarse; render a full-quality settle frame when motion stops */
-static long frametime;	/* previous redraw's cost in ms; shown in the status bar */
+static int needfine;	/* need full-quality settle frame */
+static long frametime;	/* previous frame cost, ms */
 
-/*
- * Sample rate of /dev/audio, in Hz.  Every decoder play(1) runs
- * emits s16c2r44100 (mp3dec/oggdec by definition, aacdec via its
- * own internal pcmconv), so at the default rate the decoder output
- * goes straight to the device; at any other rate (-r) an extra
- * pcmconv stage resamples 44100 -> devrate.
+/* Sample rate of /dev/audio in Hz.  Decoders emit s16c2r44100;
+ * at any other rate, a pcmconv stage resamples to devrate.
  */
 int devrate = 44100;
 
@@ -93,14 +76,8 @@ startstream(int idx)
 		return;
 
 	/*
-	 * play(1) fetches the URL (hget/webfs), sniffs the format
-	 * and runs the matching decoder.  See devrate above for why
-	 * the pcmconv stage exists only when the device isn't 44100.
-	 *
-	 * RFCFDG: fresh fd table; 0/1/2 are set up below.
-	 * RFNOTEG: new note group, so postnote(PNGROUP) in
-	 *   stopstream() kills the whole pipeline -- rc, play, hget,
-	 *   the decoder and pcmconv -- in one shot.
+	 * play(1) fetches URL via hget/webfs, detects format, runs decoder.
+	 * RFCFDG: fresh fd table. RFNOTEG: kills the whole pipeline.
 	 * RFNOWAIT: no zombie to reap.
 	 */
 	qurl = quotestrdup(stations[idx].url);
@@ -251,7 +228,7 @@ loadstations(char *path)
 		if(*s) *s++ = 0;
 		s = skipws(s);
 
-		/* name: if quoted, read to closing quote */
+		/* parse: quoted name or unquoted name up to the last token (URL) */
 		if(*s == '"'){
 			s++;
 			name = s;
@@ -260,11 +237,8 @@ loadstations(char *path)
 			s = skipws(s);
 			url = s;
 		} else {
+			/* unquoted: name is everything before the last token (URL) */
 			name = s;
-			/*
-			 * name is everything up to the last
-			 * whitespace-separated token (the url)
-			 */
 			last = nil;
 			for(t = s; *t; t++){
 				if(*t == ' ' || *t == '\t'){
@@ -537,13 +511,9 @@ main(int argc, char **argv)
 		fprint(2, "warning: could not load %s: %r\n", stationfile);
 
 	orbitinit(&orb, 0.0, 30.0, 1.0);
-	/*
-	 * frictionref makes orbittick() integrate real elapsed time
-	 * in Tickms-sized steps, so the spin's trajectory is
-	 * wall-clock, not tick-count (see view.h and the Etick case).
-	 * zoommax 512 is what it takes to separate same-city station
-	 * clusters; stationhit() box-rejects before squaring so the
-	 * pixel radii involved can't overflow int.
+	/* frictionref: spin is wall-clock, not frame-count.
+	 * zoommax 512: separates same-city clusters; stationhit()
+	 * box-rejects before squaring so radii don't overflow int.
 	 */
 	orb.frictionref = Tickms;
 	orb.zoommin = 0.5;
@@ -560,11 +530,7 @@ main(int argc, char **argv)
 		case Emouse:
 			m = ev.mouse;
 
-			/*
-			 * scroll wheel zoom; keep oldbuttons current on
-			 * this early exit so a chorded scroll+button
-			 * event can't retrigger the edge detection below.
-			 */
+			/* scroll zoom; keep oldbuttons current for edge detection */
 			if(m.buttons & 8){
 				orbitzoom(&orb, 1.15);
 				zoomredraw();
@@ -584,27 +550,14 @@ main(int argc, char **argv)
 					/* button-down edge: grab stops any spin */
 					orbitdown(&orb, m.xy.x, m.xy.y, m.msec);
 				} else {
-					/*
-					 * Motion while held: same radius as the
-					 * renderer, so drag tracks 1:1.  No
-					 * redraw here -- only update the orbit
-					 * and mark dirty; the Etick renders the
-					 * latest position once per tick, so a
-					 * slow frame can't backlog the queue.
-					 */
+					/* motion: update orbit, mark dirty; Etick renders once per tick */
 					globegeom(globerect(), orb.zoom, &cx, &cy, &rad);
 					orbitmove(&orb, m.xy.x, m.xy.y, m.msec,
 						180.0 / rad);
 					dirty = 1;
 				}
 			} else {
-				/*
-				 * No button 1: end any drag, keeping the
-				 * launch velocity.  Not an oldbuttons edge
-				 * test: the scroll branches above overwrite
-				 * oldbuttons, so a release during a scroll
-				 * chord would lose the edge.
-				 */
+				/* button 1 up: end drag, keep velocity; edge detection works despite scroll overwriting oldbuttons */
 				if(orb.dragging)
 					orbitup(&orb);
 			}
@@ -631,13 +584,7 @@ main(int argc, char **argv)
 					stopstream();
 					break;
 				case Mreload:
-					/*
-					 * indices into stations[] are meaningless
-					 * across a reload; stopping the stream is
-					 * less surprising than a status bar that
-					 * names the wrong station.  On failure
-					 * loadstations() leaves the old list.
-					 */
+					/* stop stream (indices meaningless across reload); old list preserved on failure */
 					stopstream();
 					if(loadstations(stationfile) < 0)
 						fprint(2, "reload: could not load %s: %r\n", stationfile);
@@ -650,13 +597,7 @@ main(int argc, char **argv)
 				redraw();
 			}
 
-			/*
-			 * Hover.  A selection change doesn't touch the
-			 * view, so it takes the light path -- unless a
-			 * view redraw is already pending, in which case
-			 * back lags the orbit and the queued full redraw
-			 * will show the new selection anyway.
-			 */
+			/* hover: light path unless a view redraw is pending */
 			if(m.buttons == 0 && !orb.dragging){
 				int s = findstation(m.xy);
 				if(s != selstation){
@@ -729,17 +670,7 @@ main(int argc, char **argv)
 			break;
 
 		case Etick:
-			/*
-			 * Advance the spin by real elapsed time, not a
-			 * nominal Tickms: ticks run late whenever a frame
-			 * outlasts the interval, and orb.frictionref makes
-			 * orbittick() subdivide a long interval correctly.
-			 * Guards: a non-positive delta (a negative nsec()
-			 * reading has been observed for real; NOTES.md)
-			 * falls back to one nominal tick, and a long stall
-			 * (hidden window, busy machine) is capped so the
-			 * globe resumes rather than teleports.
-			 */
+			/* advance spin by real elapsed time; guards against nsec() anomalies and long stalls */
 			now = nsec();
 			dtms = (now - lasttick) / 1000000.0;
 			lasttick = now;
@@ -752,28 +683,11 @@ main(int argc, char **argv)
 			if(orbittick(&orb, dtms))
 				dirty = 1;
 
-			/*
-			 * Skip this tick's redraw if a keystroke is
-			 * waiting (so 'q' isn't starved by a fast spin
-			 * whose frames outlast the tick) or another tick
-			 * is already queued (one redraw for the whole
-			 * backlog, with fully advanced state).
-			 */
+			/* skip redraw if a keystroke is waiting or another tick is queued */
 			if(ecankbd() || ecanread(Etick))
 				break;
 
-			/*
-			 * Every view-changing redraw -- drag, spin, zoom
-			 * -- funnels through dirty and renders here, at
-			 * most once per tick, so the event queue can never
-			 * back up behind slow frames.  Motion frames render
-			 * coarse (half-res earth); when motion stops, one
-			 * full-quality settle frame follows.  Zoom lands
-			 * here too even though zoomredraw() already showed
-			 * a preview: this real render is what re-anchors
-			 * the warp cache.  Selection-only changes bypass
-			 * all of this via redrawsel().
-			 */
+			/* view-changing redraws: render once per tick max. Coarse during motion, settle frame on stop. */
 			if(dirty){
 				dirty = 0;
 				globecoarse(1);
